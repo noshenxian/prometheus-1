@@ -16,6 +16,7 @@ package remote
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"sync"
@@ -382,11 +383,13 @@ func (m *queueManagerMetrics) unregister() {
 // external timeseries database.
 type WriteClient interface {
 	// Store stores the given samples in the remote storage.
-	Store(ctx context.Context, req []byte, retryAttempt int) error
+	Store(ctx context.Context, req []byte, retryAttempt int, compression string) error
 	// Name uniquely identifies the remote storage.
 	Name() string
 	// Endpoint is the remote read or write endpoint for the storage client.
 	Endpoint() string
+	// Get the protocol versions supported by the endpoint
+	GetProtoVersions(ctx context.Context) (string, error)
 }
 
 type RemoteWriteFormat int64 //nolint:revive // exported.
@@ -412,8 +415,9 @@ type QueueManager struct {
 	sendNativeHistograms bool
 	watcher              *wlog.Watcher
 	metadataWatcher      *MetadataWatcher
-	// experimental feature, new remote write proto format
-	rwFormat RemoteWriteFormat
+	// experimental feature, new remote write proto format and compression system in use
+	rwFormat      RemoteWriteFormat
+	rwCompression string
 
 	clientMtx   sync.RWMutex
 	storeClient WriteClient
@@ -463,6 +467,7 @@ func NewQueueManager(
 	enableExemplarRemoteWrite bool,
 	enableNativeHistogramRemoteWrite bool,
 	rwFormat RemoteWriteFormat,
+	rwCompression string,
 ) *QueueManager {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -487,7 +492,8 @@ func NewQueueManager(
 		sendNativeHistograms: enableNativeHistogramRemoteWrite,
 		// TODO: we should eventually set the format via content negotiation,
 		// so this field would be the desired format, maybe with a fallback?
-		rwFormat: rwFormat,
+		rwFormat:      rwFormat,
+		rwCompression: rwCompression,
 
 		seriesLabels:         make(map[chunks.HeadSeriesRef]labels.Labels),
 		seriesMetadata:       make(map[chunks.HeadSeriesRef]*metadata.Metadata),
@@ -528,6 +534,7 @@ func NewQueueManager(
 	}
 	t.shards = t.newShards()
 
+	// ALEXG: We need to set rwFormat and compression
 	return t
 }
 
@@ -566,7 +573,8 @@ func (t *QueueManager) AppendWatcherMetadata(ctx context.Context, metadata []scr
 
 func (t *QueueManager) sendMetadataWithBackoff(ctx context.Context, metadata []prompb.MetricMetadata, pBuf *proto.Buffer) error {
 	// Build the WriteRequest with no samples.
-	req, _, err := buildWriteRequest(nil, metadata, pBuf, nil)
+	compression := t.rwCompression // Local copy in case it changes below here
+	req, _, err := buildWriteRequest(nil, metadata, pBuf, nil, compression)
 	if err != nil {
 		return err
 	}
@@ -589,7 +597,7 @@ func (t *QueueManager) sendMetadataWithBackoff(ctx context.Context, metadata []p
 		}
 
 		begin := time.Now()
-		err := t.storeClient.Store(ctx, req, try)
+		err := t.storeClient.Store(ctx, req, try, compression)
 		t.metrics.sentBatchDuration.Observe(time.Since(begin).Seconds())
 
 		if err != nil {
@@ -1481,10 +1489,12 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 			case Version1:
 				nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 				n := nPendingSamples + nPendingExemplars + nPendingHistograms
-				s.sendSamples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf)
+				// TODO - do something with return code of s.sendV1Samples() in case it is a 406
+				s.sendV1Samples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf)
 			case Version2:
 				nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := populateV2TimeSeries(&symbolTable, batch, pendingMinStrData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 				n := nPendingSamples + nPendingExemplars + nPendingHistograms
+				// TODO - do something with return code of s.sendV2Samples() in case it is a 406
 				s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf)
 				symbolTable.clear()
 			}
@@ -1501,12 +1511,14 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 				case Version1:
 					nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 					n := nPendingSamples + nPendingExemplars + nPendingHistograms
-					s.sendSamples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf)
+					// TODO - do something with return code of s.sendV1Samples() in case it is a 406
+					s.sendV1Samples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf)
 					level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending buffered data", "samples", nPendingSamples,
 						"exemplars", nPendingExemplars, "shard", shardNum, "histograms", nPendingHistograms)
 				case Version2:
 					nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := populateV2TimeSeries(&symbolTable, batch, pendingMinStrData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 					n := nPendingSamples + nPendingExemplars + nPendingHistograms
+					// TODO - do something with return code of s.sendV2Samples() in case it is a 406
 					s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf)
 					symbolTable.clear()
 				}
@@ -1558,25 +1570,31 @@ func populateTimeSeries(batch []timeSeries, pendingData []prompb.TimeSeries, sen
 	return nPendingSamples, nPendingExemplars, nPendingHistograms
 }
 
-func (s *shards) sendSamples(ctx context.Context, series []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount int, pBuf *proto.Buffer, buf *[]byte) {
+func (s *shards) sendV1Samples(ctx context.Context, series []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount int, pBuf *proto.Buffer, buf *[]byte) error {
 	begin := time.Now()
 	// Build the WriteRequest with no metadata.
 	// Failing to build the write request is non-recoverable, since it will
 	// only error if marshaling the proto to bytes fails.
-	req, highest, err := buildWriteRequest(series, nil, pBuf, buf)
+	req, highest, err := buildWriteRequest(series, nil, pBuf, buf, s.qm.rwCompression)
 	if err == nil {
 		err = s.sendSamplesWithBackoff(ctx, req, sampleCount, exemplarCount, histogramCount, 0, highest)
 	}
 	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, 0, time.Since(begin))
+
+	// Return the error in case it is a 406 and we need to reformat the data
+	return err
 }
 
-func (s *shards) sendV2Samples(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte) {
+func (s *shards) sendV2Samples(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte) error {
 	begin := time.Now()
-	req, highest, err := buildMinimizedWriteRequestStr(samples, labels, pBuf, buf)
+	req, highest, err := buildMinimizedWriteRequestStr(samples, labels, pBuf, buf, s.qm.rwCompression)
 	if err == nil {
 		err = s.sendSamplesWithBackoff(ctx, req, sampleCount, exemplarCount, histogramCount, metadataCount, highest)
 	}
 	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, metadataCount, time.Since(begin))
+
+	// Return the error in case it is a 406 and we need to reformat the data
+	return err
 }
 
 func (s *shards) updateMetrics(ctx context.Context, err error, sampleCount, exemplarCount, histogramCount, metadataCount int, duration time.Duration) {
@@ -1633,7 +1651,7 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, rawReq []byte, samp
 		s.qm.metrics.exemplarsTotal.Add(float64(exemplarCount))
 		s.qm.metrics.histogramsTotal.Add(float64(histogramCount))
 		s.qm.metrics.metadataTotal.Add(float64(metadataCount))
-		err := s.qm.client().Store(ctx, rawReq, try)
+		err := s.qm.client().Store(ctx, rawReq, try, s.qm.rwCompression)
 		s.qm.metrics.sentBatchDuration.Observe(time.Since(begin).Seconds())
 
 		if err != nil {
@@ -1768,7 +1786,7 @@ func sendWriteRequestWithBackoff(ctx context.Context, cfg config.QueueConfig, l 
 	}
 }
 
-func buildWriteRequest(samples []prompb.TimeSeries, metadata []prompb.MetricMetadata, pBuf *proto.Buffer, buf *[]byte) ([]byte, int64, error) {
+func buildWriteRequest(samples []prompb.TimeSeries, metadata []prompb.MetricMetadata, pBuf *proto.Buffer, buf *[]byte, compression string) ([]byte, int64, error) {
 	var highest int64
 	for _, ts := range samples {
 		// At the moment we only ever append a TimeSeries with a single sample or exemplar in it.
@@ -1805,10 +1823,18 @@ func buildWriteRequest(samples []prompb.TimeSeries, metadata []prompb.MetricMeta
 	} else {
 		buf = &[]byte{}
 	}
-	compressed := snappy.Encode(*buf, pBuf.Bytes())
-	if n := snappy.MaxEncodedLen(len(pBuf.Bytes())); n > len(*buf) {
-		// grow the buffer for the next time
-		*buf = make([]byte, n)
+
+	var compressed []byte
+
+	switch compression {
+	case "snappy":
+		compressed = snappy.Encode(*buf, pBuf.Bytes())
+		if n := snappy.MaxEncodedLen(len(pBuf.Bytes())); n > len(*buf) {
+			// grow the buffer for the next time
+			*buf = make([]byte, n)
+		}
+	default:
+		return nil, highest, fmt.Errorf("Unknown compression scheme [%s]", compression)
 	}
 
 	return compressed, highest, nil
@@ -1846,7 +1872,7 @@ func (r *rwSymbolTable) clear() {
 	}
 }
 
-func buildMinimizedWriteRequestStr(samples []writev2.TimeSeries, labels []string, pBuf, buf *[]byte) ([]byte, int64, error) {
+func buildMinimizedWriteRequestStr(samples []writev2.TimeSeries, labels []string, pBuf, buf *[]byte, compression string) ([]byte, int64, error) {
 	var highest int64
 	for _, ts := range samples {
 		// At the moment we only ever append a TimeSeries with a single sample or exemplar in it.
@@ -1884,10 +1910,18 @@ func buildMinimizedWriteRequestStr(samples []writev2.TimeSeries, labels []string
 		buf = &[]byte{}
 	}
 
-	compressed := snappy.Encode(*buf, data)
-	if n := snappy.MaxEncodedLen(len(data)); n > len(*buf) {
-		// grow the buffer for the next time
-		*buf = make([]byte, n)
+	var compressed []byte
+
+	switch compression {
+	case "snappy":
+		compressed = snappy.Encode(*buf, data)
+		if n := snappy.MaxEncodedLen(len(data)); n > len(*buf) {
+			// grow the buffer for the next time
+			*buf = make([]byte, n)
+		}
+	default:
+		return nil, highest, fmt.Errorf("Unknown compression scheme [%s]", compression)
 	}
+
 	return compressed, highest, nil
 }

@@ -197,9 +197,45 @@ type RecoverableError struct {
 	retryAfter model.Duration
 }
 
+// Attempt a HEAD request against a remote write endpoint to see what it supports
+func (c *Client) GetProtoVersions(ctx context.Context) (string, error) {
+	// If we are in Version1 mode then don't even bother
+	if c.rwFormat == Version1 {
+		return RemoteWriteVersion1HeaderValue, nil
+	}
+
+	httpReq, err := http.NewRequest("HEAD", c.urlString, nil)
+	if err != nil {
+		// Errors from NewRequest are from unparsable URLs, so are not
+		// recoverable.
+		return "", err
+	}
+
+	// Set the version header to be nice
+	httpReq.Header.Set(RemoteWriteVersionHeader, RemoteWriteVersion20HeaderValue)
+	httpReq.Header.Set("User-Agent", UserAgent)
+
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	httpResp, err := c.Client.Do(httpReq.WithContext(ctx))
+	if err != nil {
+		// We don't attempt a retry here
+		return "", err
+	}
+
+	if httpResp.StatusCode != 200 {
+		return "", fmt.Errorf(httpResp.Status)
+	}
+
+	promHeader := httpResp.Header.Get(RemoteWriteVersionHeader)
+	return promHeader, nil
+}
+
 // Store sends a batch of samples to the HTTP endpoint, the request is the proto marshalled
 // and encoded bytes from codec.go.
-func (c *Client) Store(ctx context.Context, req []byte, attempt int) error {
+func (c *Client) Store(ctx context.Context, req []byte, attempt int, compression string) error {
+
 	httpReq, err := http.NewRequest("POST", c.urlString, bytes.NewReader(req))
 	if err != nil {
 		// Errors from NewRequest are from unparsable URLs, so are not
@@ -207,14 +243,14 @@ func (c *Client) Store(ctx context.Context, req []byte, attempt int) error {
 		return err
 	}
 
-	httpReq.Header.Add("Content-Encoding", "snappy")
+	httpReq.Header.Add("Content-Encoding", compression)
 	httpReq.Header.Set("Content-Type", "application/x-protobuf")
 	httpReq.Header.Set("User-Agent", UserAgent)
 
 	if c.rwFormat == Version1 {
 		httpReq.Header.Set(RemoteWriteVersionHeader, RemoteWriteVersion1HeaderValue)
 	} else {
-		// Set the right header if we're using v1.1 remote write protocol
+		// Set the right header if we're using v2.0 remote write protocol
 		httpReq.Header.Set(RemoteWriteVersionHeader, RemoteWriteVersion20HeaderValue)
 	}
 
@@ -239,7 +275,11 @@ func (c *Client) Store(ctx context.Context, req []byte, attempt int) error {
 		httpResp.Body.Close()
 	}()
 
-	// TODO-RW11: Here is where we need to handle version downgrade on error
+	if httpResp.StatusCode == 406 {
+		// TODO - return this?
+		err = fmt.Errorf("server returned NotAcceptable")
+		return RecoverableError{err, model.Duration(0) * model.Duration(time.Second)}
+	}
 
 	if httpResp.StatusCode/100 != 2 {
 		scanner := bufio.NewScanner(io.LimitReader(httpResp.Body, maxErrMsgLen))
@@ -364,7 +404,11 @@ func NewTestClient(name, url string) WriteClient {
 	return &TestClient{name: name, url: url}
 }
 
-func (c *TestClient) Store(_ context.Context, req []byte, _ int) error {
+func (c *TestClient) GetProtoVersions(_ context.Context) (string, error) {
+	return "2.0;snappy;,0.1.0", nil
+}
+
+func (c *TestClient) Store(_ context.Context, req []byte, _ int, _ string) error {
 	r := rand.Intn(200-100) + 100
 	time.Sleep(time.Duration(r) * time.Millisecond)
 	return nil

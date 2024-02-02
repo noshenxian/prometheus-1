@@ -56,7 +56,7 @@ func TestRemoteWriteHeadHandler(t *testing.T) {
 
 func TestRemoteWriteHandlerMinimizedMissingContentEncoding(t *testing.T) {
 	// Send a v2 request without a "Content-Encoding:" header -> 406
-	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil)
+	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -78,7 +78,7 @@ func TestRemoteWriteHandlerMinimizedMissingContentEncoding(t *testing.T) {
 
 func TestRemoteWriteHandlerInvalidCompression(t *testing.T) {
 	// Send a v2 request without an unhandled compression scheme -> 406
-	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil)
+	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -99,7 +99,7 @@ func TestRemoteWriteHandlerInvalidCompression(t *testing.T) {
 
 func TestRemoteWriteHandlerInvalidVersion(t *testing.T) {
 	// Send a protocol version number that isn't recognised/supported -> 400
-	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil)
+	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -118,7 +118,7 @@ func TestRemoteWriteHandlerInvalidVersion(t *testing.T) {
 }
 
 func TestRemoteWriteHandler(t *testing.T) {
-	buf, _, err := buildWriteRequest(writeRequestFixture.Timeseries, nil, nil, nil)
+	buf, _, err := buildWriteRequest(writeRequestFixture.Timeseries, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -168,7 +168,7 @@ func TestRemoteWriteHandler(t *testing.T) {
 }
 
 func TestRemoteWriteHandlerMinimizedFormat(t *testing.T) {
-	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil)
+	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -228,7 +228,7 @@ func TestOutOfOrderSample(t *testing.T) {
 	buf, _, err := buildWriteRequest([]prompb.TimeSeries{{
 		Labels:  []prompb.Label{{Name: "__name__", Value: "test_metric"}},
 		Samples: []prompb.Sample{{Value: 1, Timestamp: 0}},
-	}}, nil, nil, nil)
+	}}, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -254,7 +254,7 @@ func TestOutOfOrderExemplar(t *testing.T) {
 	buf, _, err := buildWriteRequest([]prompb.TimeSeries{{
 		Labels:    []prompb.Label{{Name: "__name__", Value: "test_metric"}},
 		Exemplars: []prompb.Exemplar{{Labels: []prompb.Label{{Name: "foo", Value: "bar"}}, Value: 1, Timestamp: 0}},
-	}}, nil, nil, nil)
+	}}, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -278,7 +278,7 @@ func TestOutOfOrderHistogram(t *testing.T) {
 	buf, _, err := buildWriteRequest([]prompb.TimeSeries{{
 		Labels:     []prompb.Label{{Name: "__name__", Value: "test_metric"}},
 		Histograms: []prompb.Histogram{HistogramToHistogramProto(0, &testHistogram), FloatHistogramToHistogramProto(1, testHistogram.ToFloat(nil))},
-	}}, nil, nil, nil)
+	}}, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -308,7 +308,7 @@ func BenchmarkRemoteWritehandler(b *testing.B) {
 				{Name: "test_label_name_" + num, Value: labelValue + num},
 			},
 			Histograms: []prompb.Histogram{HistogramToHistogramProto(0, &testHistogram)},
-		}}, nil, nil, nil)
+		}}, nil, nil, nil, "snappy")
 		require.NoError(b, err)
 		req, err := http.NewRequest("", "", bytes.NewReader(buf))
 		require.NoError(b, err)
@@ -327,7 +327,7 @@ func BenchmarkRemoteWritehandler(b *testing.B) {
 }
 
 func TestCommitErr(t *testing.T) {
-	buf, _, err := buildWriteRequest(writeRequestFixture.Timeseries, nil, nil, nil)
+	buf, _, err := buildWriteRequest(writeRequestFixture.Timeseries, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -365,7 +365,7 @@ func BenchmarkRemoteWriteOOOSamples(b *testing.B) {
 	// TODO: test with other proto format(s)
 	handler := NewWriteHandler(log.NewNopLogger(), nil, db.Head(), Version1)
 
-	buf, _, err := buildWriteRequest(genSeriesWithSample(1000, 200*time.Minute.Milliseconds()), nil, nil, nil)
+	buf, _, err := buildWriteRequest(genSeriesWithSample(1000, 200*time.Minute.Milliseconds()), nil, nil, nil, "snappy")
 	require.NoError(b, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -378,7 +378,7 @@ func BenchmarkRemoteWriteOOOSamples(b *testing.B) {
 
 	var bufRequests [][]byte
 	for i := 0; i < 100; i++ {
-		buf, _, err = buildWriteRequest(genSeriesWithSample(1000, int64(80+i)*time.Minute.Milliseconds()), nil, nil, nil)
+		buf, _, err = buildWriteRequest(genSeriesWithSample(1000, int64(80+i)*time.Minute.Milliseconds()), nil, nil, nil, "snappy")
 		require.NoError(b, err)
 		bufRequests = append(bufRequests, buf)
 	}
