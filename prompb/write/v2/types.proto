@@ -101,6 +101,8 @@ message Histogram {
   // bucket boundary is the previous boundary times 2^(2^-n). In the
   // future, more bucket schemas may be added using numbers < -4 or >
   // 8.
+  // TODO(bwplotka): Explain schema semantics for custom_bounds (custom histograms)
+  // once designed.
   sint32 schema             = 4;
   double zero_threshold     = 5; // Breadth of the zero bucket.
   oneof zero_count { // Count in zero bucket.
@@ -111,16 +113,16 @@ message Histogram {
   // Negative Buckets.
   repeated BucketSpan negative_spans =  8 [(gogoproto.nullable) = false];
   // Use either "negative_deltas" or "negative_counts", the former for
-  // regular histograms with integer counts, the latter for float
-  // histograms.
+  // regular exponential histograms with integer counts, the latter for exponential
+  // float histograms.
   repeated sint64 negative_deltas    =  9; // Count delta of each bucket compared to previous one (or to zero for 1st bucket).
   repeated double negative_counts    = 10; // Absolute count of each bucket.
 
   // Positive Buckets.
   repeated BucketSpan positive_spans = 11 [(gogoproto.nullable) = false];
   // Use either "positive_deltas" or "positive_counts", the former for
-  // regular histograms with integer counts, the latter for float
-  // histograms.
+  // regular exponential histograms with integer counts, the latter for exponential
+  // float histograms.
   repeated sint64 positive_deltas    = 12; // Count delta of each bucket compared to previous one (or to zero for 1st bucket).
   repeated double positive_counts    = 13; // Absolute count of each bucket.
 
@@ -128,6 +130,26 @@ message Histogram {
   // timestamp is in ms format, see model/timestamp/timestamp.go for
   // conversion from time.Time to Prometheus timestamp.
   int64 timestamp = 15;
+
+  // custom_bounds specify monotonically increasing upper inclusive boundary for
+  // the bucket counts in positive_counts or/and negative_counts (or corresponding
+  // deltas) with arbitrary widths for this histogram. For each upper boundary
+  // the previous boundary represent lower exclusive/ boundary for that bucket.
+  //
+  // The first element is the upper inclusive boundary for the first bucket,
+  // which implicitly has a lower inclusive bound of -Inf. This is similar to
+  // "le" label semantics on classic histograms. You may add a bucket with an
+  // upper bound of 0 to make sure that you really have no negative observations,
+  // but in practice, native histogram rendering will show both with or without
+  // first upper boundary 0 and no negative counts as the same case.
+  //
+  // The last element is a lower bound for the implicit +Inf bucket (overflow buckets).
+  //
+  // In other words custom_buckets represents custom, explicit buckets that could
+  // have been converted from classic histograms. Refer to schema on when
+  // the user should use the custom_bounds vs positive_spans or negative_spans
+  // for exponential sparse histograms.
+  repeated double custom_bounds = 16;
 }
 
 // A BucketSpan defines a number of consecutive buckets with their
