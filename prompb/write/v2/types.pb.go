@@ -465,14 +465,18 @@ type Histogram struct {
 	// Negative Buckets.
 	NegativeSpans []BucketSpan `protobuf:"bytes,8,rep,name=negative_spans,json=negativeSpans,proto3" json:"negative_spans"`
 	// Use either "negative_deltas" or "negative_counts", the former for
-	// regular exponential histograms with integer counts, the latter for exponential
+	// regular histograms with integer counts, the latter for
 	// float histograms.
 	NegativeDeltas []int64   `protobuf:"zigzag64,9,rep,packed,name=negative_deltas,json=negativeDeltas,proto3" json:"negative_deltas,omitempty"`
 	NegativeCounts []float64 `protobuf:"fixed64,10,rep,packed,name=negative_counts,json=negativeCounts,proto3" json:"negative_counts,omitempty"`
 	// Positive Buckets.
+	// In case of "custom_bounds" use, the positive buckets are interpreted as follows:
+	// * The span offset+length points to an the index of the custom_bound array
+	// or +Inf if pointing to outside the array.
+	// * The counts and deltas have the same meaning as for exponential histograms.
 	PositiveSpans []BucketSpan `protobuf:"bytes,11,rep,name=positive_spans,json=positiveSpans,proto3" json:"positive_spans"`
 	// Use either "positive_deltas" or "positive_counts", the former for
-	// regular exponential histograms with integer counts, the latter for exponential
+	// regular histograms with integer counts, the latter for
 	// float histograms.
 	PositiveDeltas []int64             `protobuf:"zigzag64,12,rep,packed,name=positive_deltas,json=positiveDeltas,proto3" json:"positive_deltas,omitempty"`
 	PositiveCounts []float64           `protobuf:"fixed64,13,rep,packed,name=positive_counts,json=positiveCounts,proto3" json:"positive_counts,omitempty"`
@@ -481,23 +485,30 @@ type Histogram struct {
 	// conversion from time.Time to Prometheus timestamp.
 	Timestamp int64 `protobuf:"varint,15,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	// custom_bounds specify monotonically increasing upper inclusive boundary for
-	// the bucket counts in positive_counts or/and negative_counts (or corresponding
-	// deltas) with arbitrary widths for this histogram. For each upper boundary
-	// the previous boundary represent lower exclusive/ boundary for that bucket.
+	// the bucket counts with arbitrary widths for this histogram. In other words,
+	// custom_bounds represents custom, explicit bucketing that could have been
+	// converted from classic histograms.
 	//
-	// The first element is the upper inclusive boundary for the first bucket,
-	// which implicitly has a lower inclusive bound of -Inf. This is similar to
-	// "le" label semantics on classic histograms. You may add a bucket with an
-	// upper bound of 0 to make sure that you really have no negative observations,
-	// but in practice, native histogram rendering will show both with or without
-	// first upper boundary 0 and no negative counts as the same case.
+	// Those bounds are then referenced by spans in positive_spans with corresponding positive
+	// counts of deltas (refer to positive_spans for more details). This way we can
+	// have encode sparse histograms with custom bucketing (many buckets are often
+	// not used).
 	//
-	// The last element is a lower bound for the implicit +Inf bucket (overflow buckets).
+	// Note that for custom bounds, even negative observations are placed in the positive
+	// counts to simplify the implementation and avoid ambiguity of where to place
+	// an underflow bucket (for example (-2, 1]. Therefore negative buckets and
+	// the zero bucket are unused, if scheme indicates custom bucketing.
 	//
-	// In other words custom_buckets represents custom, explicit buckets that could
-	// have been converted from classic histograms. Refer to schema on when
-	// the user should use the custom_bounds vs positive_spans or negative_spans
-	// for exponential sparse histograms.
+	// For each upper boundary the previous boundary represent the lower exclusive
+	// boundary for that bucket. The first element is the upper inclusive boundary
+	// for the first bucket, which implicitly has a lower inclusive bound of -Inf.
+	// This is similar to "le" label semantics on classic histograms. You may add a
+	// bucket with an upper bound of 0 to make sure that you really have no negative
+	// observations, but in practice, native histogram rendering will show both with
+	// or without first upper boundary 0 and no negative counts as the same case.
+	//
+	// The last element is a lower bound for the implicit +Inf bucket (the overflow
+	// bucket).
 	CustomBounds         []float64 `protobuf:"fixed64,16,rep,packed,name=custom_bounds,json=customBounds,proto3" json:"custom_bounds,omitempty"`
 	XXX_NoUnkeyedLiteral struct{}  `json:"-"`
 	XXX_unrecognized     []byte    `json:"-"`
