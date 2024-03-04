@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -390,6 +391,8 @@ type WriteClient interface {
 	Endpoint() string
 	// Get the protocol versions supported by the endpoint
 	GetProtoVersions(ctx context.Context) (string, error)
+	// Get the last RW header received from the endpoint
+	GetLastRWHeader() string
 }
 
 type RemoteWriteFormat int64 //nolint:revive // exported.
@@ -416,8 +419,8 @@ type QueueManager struct {
 	watcher              *wlog.Watcher
 	metadataWatcher      *MetadataWatcher
 	// experimental feature, new remote write proto format and compression system in use
-	rwFormat      RemoteWriteFormat
-	rwCompression string
+	rwFormat         RemoteWriteFormat
+	lastRWSendFormat string
 
 	clientMtx   sync.RWMutex
 	storeClient WriteClient
@@ -467,7 +470,6 @@ func NewQueueManager(
 	enableExemplarRemoteWrite bool,
 	enableNativeHistogramRemoteWrite bool,
 	rwFormat RemoteWriteFormat,
-	rwCompression string,
 ) *QueueManager {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -492,8 +494,8 @@ func NewQueueManager(
 		sendNativeHistograms: enableNativeHistogramRemoteWrite,
 		// TODO: we should eventually set the format via content negotiation,
 		// so this field would be the desired format, maybe with a fallback?
-		rwFormat:      rwFormat,
-		rwCompression: rwCompression,
+		rwFormat:         rwFormat,
+		lastRWSendFormat: "",
 
 		seriesLabels:         make(map[chunks.HeadSeriesRef]labels.Labels),
 		seriesMetadata:       make(map[chunks.HeadSeriesRef]*metadata.Metadata),
@@ -534,7 +536,6 @@ func NewQueueManager(
 	}
 	t.shards = t.newShards()
 
-	// ALEXG: We need to set rwFormat and compression
 	return t
 }
 
@@ -573,7 +574,8 @@ func (t *QueueManager) AppendWatcherMetadata(ctx context.Context, metadata []scr
 
 func (t *QueueManager) sendMetadataWithBackoff(ctx context.Context, metadata []prompb.MetricMetadata, pBuf *proto.Buffer) error {
 	// Build the WriteRequest with no samples.
-	compression := t.rwCompression // Local copy in case it changes below here
+	// TODO - get compression from lastRWSendFormat?
+	compression := "snappy"
 	req, _, err := buildWriteRequest(nil, metadata, pBuf, nil, compression)
 	if err != nil {
 		return err
@@ -1412,6 +1414,43 @@ func (q *queue) newBatch(capacity int) []timeSeries {
 	return make([]timeSeries, 0, capacity)
 }
 
+func negotiateRWProto(rwFormat RemoteWriteFormat, lastHeaderSeen string) (string, RemoteWriteFormat) {
+	if rwFormat == Version1 {
+		// If we're only handling Version1 then all we can do is that with snappy compression
+		return "snappy", Version1
+	}
+	if rwFormat != Version2 {
+		// If we get here then someone has added a new RemoteWriteFormat value but hasn't
+		// fixed this function to handle it
+		// panic!
+		panic(fmt.Sprintf("Unhandled RemoteWriteFormat %q", rwFormat))
+	}
+	if lastHeaderSeen == "" {
+		// We haven't had a valid header, so we just default to 0.1.0/snappy
+		// TODO - Log something here?
+		return "snappy", Version1
+	}
+	// We can currently handle:
+	// "2.0;snappy"
+	// "0.1.0" - implicity compression of snappy
+	// lastHeaderSeen should contain a list of tuples
+	// If we find a match to something we can handle then we can return that
+	for _, tuple := range strings.Split(lastHeaderSeen, ",") {
+		// Remove spaces from the tuple
+		curr := strings.ReplaceAll(tuple, " ", "")
+		switch curr {
+		case "2.0;snappy":
+			return "snappy", Version2
+		case "0.1.0":
+			return "snappy", Version1
+		}
+	}
+	// TODO - Log something here?
+
+	// Otherwise we have to default to "0.1.0;/snappy"
+	return "snappy", Version1
+}
+
 func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 	defer func() {
 		if s.running.Dec() == 0 {
@@ -1485,17 +1524,20 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 			if !ok {
 				return
 			}
-			switch s.qm.rwFormat {
+			// Work out what version to send based on the last header seen and the QM's rwFormat setting
+			lastHeaderSeen := s.qm.storeClient.GetLastRWHeader()
+			compression, rwFormat := negotiateRWProto(s.qm.rwFormat, lastHeaderSeen)
+			switch rwFormat {
 			case Version1:
 				nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 				n := nPendingSamples + nPendingExemplars + nPendingHistograms
 				// TODO - do something with return code of s.sendV1Samples() in case it is a 406
-				s.sendV1Samples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf)
+				s.sendV1Samples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
 			case Version2:
 				nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := populateV2TimeSeries(&symbolTable, batch, pendingMinStrData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 				n := nPendingSamples + nPendingExemplars + nPendingHistograms
 				// TODO - do something with return code of s.sendV2Samples() in case it is a 406
-				s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf)
+				s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf, compression)
 				symbolTable.clear()
 			}
 
@@ -1507,19 +1549,22 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 		case <-timer.C:
 			batch := queue.Batch()
 			if len(batch) > 0 {
-				switch s.qm.rwFormat {
+				// Work out what version to send based on the last header seen and the QM's rwFormat setting
+				lastHeaderSeen := s.qm.storeClient.GetLastRWHeader()
+				compression, rwFormat := negotiateRWProto(s.qm.rwFormat, lastHeaderSeen)
+				switch rwFormat {
 				case Version1:
 					nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 					n := nPendingSamples + nPendingExemplars + nPendingHistograms
 					// TODO - do something with return code of s.sendV1Samples() in case it is a 406
-					s.sendV1Samples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf)
+					s.sendV1Samples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
 					level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending buffered data", "samples", nPendingSamples,
 						"exemplars", nPendingExemplars, "shard", shardNum, "histograms", nPendingHistograms)
 				case Version2:
 					nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := populateV2TimeSeries(&symbolTable, batch, pendingMinStrData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 					n := nPendingSamples + nPendingExemplars + nPendingHistograms
 					// TODO - do something with return code of s.sendV2Samples() in case it is a 406
-					s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf)
+					s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf, compression)
 					symbolTable.clear()
 				}
 			}
@@ -1570,14 +1615,14 @@ func populateTimeSeries(batch []timeSeries, pendingData []prompb.TimeSeries, sen
 	return nPendingSamples, nPendingExemplars, nPendingHistograms
 }
 
-func (s *shards) sendV1Samples(ctx context.Context, series []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount int, pBuf *proto.Buffer, buf *[]byte) error {
+func (s *shards) sendV1Samples(ctx context.Context, series []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount int, pBuf *proto.Buffer, buf *[]byte, compression string) error {
 	begin := time.Now()
 	// Build the WriteRequest with no metadata.
 	// Failing to build the write request is non-recoverable, since it will
 	// only error if marshaling the proto to bytes fails.
-	req, highest, err := buildWriteRequest(series, nil, pBuf, buf, s.qm.rwCompression)
+	req, highest, err := buildWriteRequest(series, nil, pBuf, buf, compression)
 	if err == nil {
-		err = s.sendSamplesWithBackoff(ctx, req, sampleCount, exemplarCount, histogramCount, 0, highest)
+		err = s.sendSamplesWithBackoff(ctx, req, sampleCount, exemplarCount, histogramCount, 0, highest, compression)
 	}
 	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, 0, time.Since(begin))
 
@@ -1585,11 +1630,11 @@ func (s *shards) sendV1Samples(ctx context.Context, series []prompb.TimeSeries, 
 	return err
 }
 
-func (s *shards) sendV2Samples(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte) error {
+func (s *shards) sendV2Samples(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte, compression string) error {
 	begin := time.Now()
-	req, highest, err := buildMinimizedWriteRequestStr(samples, labels, pBuf, buf, s.qm.rwCompression)
+	req, highest, err := buildMinimizedWriteRequestStr(samples, labels, pBuf, buf, compression)
 	if err == nil {
-		err = s.sendSamplesWithBackoff(ctx, req, sampleCount, exemplarCount, histogramCount, metadataCount, highest)
+		err = s.sendSamplesWithBackoff(ctx, req, sampleCount, exemplarCount, histogramCount, metadataCount, highest, compression)
 	}
 	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, metadataCount, time.Since(begin))
 
@@ -1621,7 +1666,7 @@ func (s *shards) updateMetrics(ctx context.Context, err error, sampleCount, exem
 }
 
 // sendSamples to the remote storage with backoff for recoverable errors.
-func (s *shards) sendSamplesWithBackoff(ctx context.Context, rawReq []byte, sampleCount, exemplarCount, histogramCount, metadataCount int, highestTimestamp int64) error {
+func (s *shards) sendSamplesWithBackoff(ctx context.Context, rawReq []byte, sampleCount, exemplarCount, histogramCount, metadataCount int, highestTimestamp int64, compression string) error {
 	reqSize := len(rawReq)
 
 	// An anonymous function allows us to defer the completion of our per-try spans
@@ -1651,7 +1696,7 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, rawReq []byte, samp
 		s.qm.metrics.exemplarsTotal.Add(float64(exemplarCount))
 		s.qm.metrics.histogramsTotal.Add(float64(histogramCount))
 		s.qm.metrics.metadataTotal.Add(float64(metadataCount))
-		err := s.qm.client().Store(ctx, rawReq, try, s.qm.rwCompression)
+		err := s.qm.client().Store(ctx, rawReq, try, compression)
 		s.qm.metrics.sentBatchDuration.Observe(time.Since(begin).Seconds())
 
 		if err != nil {

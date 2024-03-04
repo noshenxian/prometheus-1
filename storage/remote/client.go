@@ -81,11 +81,12 @@ func init() {
 
 // Client allows reading and writing from/to a remote HTTP endpoint.
 type Client struct {
-	remoteName string            // Used to differentiate clients in metrics.
-	urlString  string            // url.String()
-	rwFormat   RemoteWriteFormat // For write clients, ignored for read clients.
-	Client     *http.Client
-	timeout    time.Duration
+	remoteName   string            // Used to differentiate clients in metrics.
+	urlString    string            // url.String()
+	rwFormat     RemoteWriteFormat // For write clients, ignored for read clients.
+	lastRWHeader string
+	Client       *http.Client
+	timeout      time.Duration
 
 	retryOnRateLimit bool
 
@@ -224,11 +225,20 @@ func (c *Client) GetProtoVersions(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	if httpResp.StatusCode != 200 {
-		return "", fmt.Errorf(httpResp.Status)
+	// See if we got a header anyway
+	promHeader := httpResp.Header.Get(RemoteWriteVersionHeader)
+
+	// Only update lastRWHeader if the X-Prometheus-Remote-Write header is not blank
+	if promHeader != "" {
+		c.lastRWHeader = promHeader
 	}
 
-	promHeader := httpResp.Header.Get(RemoteWriteVersionHeader)
+	// Check for an error
+	if httpResp.StatusCode != 200 {
+		return promHeader, fmt.Errorf(httpResp.Status)
+	}
+
+	// All ok, return header and no error
 	return promHeader, nil
 }
 
@@ -275,11 +285,21 @@ func (c *Client) Store(ctx context.Context, req []byte, attempt int, compression
 		httpResp.Body.Close()
 	}()
 
-	if httpResp.StatusCode == 406 {
-		// TODO - return this?
-		err = fmt.Errorf("server returned NotAcceptable")
-		return RecoverableError{err, model.Duration(0) * model.Duration(time.Second)}
+	// See if we got a X-Prometheus-Remote-Write header in the response
+	if promHeader := httpResp.Header.Get(RemoteWriteVersionHeader); promHeader != "" {
+		// Only update lastRWHeader if the X-Prometheus-Remote-Write header is not blank
+		c.lastRWHeader = promHeader
 	}
+
+	if httpResp.StatusCode == 406 {
+		// Return an unrecoverable error to indicate the 406
+		// TODO - should this be a new error type?
+		return fmt.Errorf("server returned StatusNotAcceptable")
+	}
+
+	// TODO - also a server that was accepting, say, "2.0;snappy" might be rolled back to prom 2.x
+	// and any attempt to send stuff as "2.0;snappy" will come back as 400
+	// TODO - Work out how to differentiate this from any other 4xx error
 
 	if httpResp.StatusCode/100 != 2 {
 		scanner := bufio.NewScanner(io.LimitReader(httpResp.Body, maxErrMsgLen))
@@ -320,6 +340,10 @@ func (c Client) Name() string {
 // Endpoint is the remote read or write endpoint.
 func (c Client) Endpoint() string {
 	return c.urlString
+}
+
+func (c *Client) GetLastRWHeader() string {
+	return c.lastRWHeader
 }
 
 // Read reads from a remote endpoint.
@@ -405,7 +429,7 @@ func NewTestClient(name, url string) WriteClient {
 }
 
 func (c *TestClient) GetProtoVersions(_ context.Context) (string, error) {
-	return "2.0;snappy;,0.1.0", nil
+	return "2.0;snappy,0.1.0", nil
 }
 
 func (c *TestClient) Store(_ context.Context, req []byte, _ int, _ string) error {
@@ -420,4 +444,8 @@ func (c *TestClient) Name() string {
 
 func (c *TestClient) Endpoint() string {
 	return c.url
+}
+
+func (c *TestClient) GetLastRWHeader() string {
+	return "2.0;snappy,0.1.0"
 }

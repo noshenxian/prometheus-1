@@ -195,30 +195,29 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 		}
 
 		// Work out what protocol and compression to use for this endpoint
-		// TODO - features
-		rwCompression := "snappy"
+		// Default to blank string, which means we haven't been able to work it out
+		lastRWProtoHeader := ""
+		lastRWProtoHeader = lastRWProtoHeader + "argle"
 		rwFormat := Version1
-
 		switch rws.rwFormat {
 		case Version1:
-			// We use the standard values as there's no negotiation to be had
-			rwCompression = "snappy"
-			rwFormat = Version1
+			// We use the standard value as there's no negotiation to be had
+			lastRWProtoHeader = RemoteWriteVersion1HeaderValue
 		case Version2:
 			// If this newer remote write format is enabled then we need to go do a HEAD
 			// to work out the desired protocol version and compressions
-			ver, err := c.GetProtoVersions(context.Background()) // TODO - better ctx to pass?
+			rwFormat = Version2
+			lastRWProtoHeader, err = c.GetProtoVersions(context.Background()) // TODO - better ctx to pass?
 			if err != nil {
-				// If we don't get a valid response we assume we can only speak remote write 1.0 to it
-				rwCompression = "snappy"
-				rwFormat = Version1
-				// TODO - log error?
-			} else {
-				// TODO - parse the header into tuples
-				// TODO - Compare with our preferred tuples
-				// TODO - bail at first match
-				rwCompression = ver // TEMPHACK to stop complaint about unused var
+				// TODO - Log an error based on this?
+				// TODO - if we get 405 (MethodNotAllowed) then we should default to 1.0 (and downgrade rwFormat)
 			}
+			// Regardless of what we get back in from GetProtoVersions() we use the value as it overrides
+			// the default blank string
+			// A blank string here means we try and check again just before sending the data
+			// Either
+			// * it is "" because there was an error, and we don't know what the receiving server can speak
+			// * or it is a non-empty string and it can be used, later on, to decide what to send
 		}
 
 		// Redacted to remove any passwords in the URL (that are
@@ -244,7 +243,6 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 			rwConf.SendExemplars,
 			rwConf.SendNativeHistograms,
 			rwFormat,
-			rwCompression,
 		)
 		// Keep track of which queues are new so we know which to start.
 		newHashes = append(newHashes, hash)

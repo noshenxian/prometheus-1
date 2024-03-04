@@ -17,10 +17,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
 	"github.com/prometheus/prometheus/model/labels"
+
 	writev2 "github.com/prometheus/prometheus/prompb/write/v2"
 
 	"github.com/go-kit/log"
@@ -50,8 +54,8 @@ func RemoteWriteHeaderNameValues(rwFormat RemoteWriteFormat) map[string]string {
 	case Version2:
 		// We need to add the supported protocol definitions in order:
 		tuples := make([]string, 0, 2)
-		// Add 2.0;snappy;
-		tuples = append(tuples, RemoteWriteVersion20HeaderValue+";snappy;")
+		// Add 2.0;snappy
+		tuples = append(tuples, RemoteWriteVersion20HeaderValue+";snappy")
 		// Add default 0.1.0
 		tuples = append(tuples, RemoteWriteVersion1HeaderValue)
 		ret[RemoteWriteVersionHeader] = strings.Join(tuples, ",")
@@ -130,8 +134,6 @@ func NewWriteHandler(logger log.Logger, reg prometheus.Registerer, appendable st
 
 func (h *writeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
-	var req *prompb.WriteRequest
-	var reqMinStr *writev2.WriteRequest
 
 	// Set the header(s) in the response based on the rwFormat the server supports
 	for hName, hValue := range RemoteWriteHeaderNameValues(h.rwFormat) {
@@ -142,51 +144,73 @@ func (h *writeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	contentEncoding := r.Header.Get("Content-Encoding")
 	protoVer := r.Header.Get(RemoteWriteVersionHeader)
 
-	if protoVer == "" {
+	switch protoVer {
+	case "":
 		// No header provided, assume 0.1.0 as everything that relies on later
-		// features MUST supply the correct headers
 		protoVer = RemoteWriteVersion1HeaderValue
-	} else if protoVer == RemoteWriteVersion20HeaderValue {
-		// This is a 2.0 request, woo
-	} else {
+	case RemoteWriteVersion1HeaderValue, RemoteWriteVersion20HeaderValue:
+		// We know this header, woo
+	default:
 		// We have a version in the header but it is not one we recognise
 		// TODO - make a proper error for this
 		level.Error(h.logger).Log("msg", "Error decoding remote write request", "err", "Unknown remote write version in headers", "ver", protoVer)
-		http.Error(w, "Unknown remote write version in headers", http.StatusBadRequest)
+		// Return a 406 so that the client can choose a more appropriate protocol to use
+		http.Error(w, "Unknown remote write version in headers", http.StatusNotAcceptable)
 		return
 	}
 
+	// Deal with 0.1.0 clients that forget to send Content-Encoding
+	if protoVer == RemoteWriteVersion1HeaderValue && contentEncoding == "" {
+		contentEncoding = "snappy"
+	}
+
+	// Read the request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		level.Error(h.logger).Log("msg", "Error decoding remote write request", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Deal with contentEncoding first
+	var decompressed []byte
+
+	switch contentEncoding {
+	case "snappy":
+		decompressed, err = snappy.Decode(nil, body)
+		if err != nil {
+			level.Error(h.logger).Log("msg", "Error decoding remote write request", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	default:
+		level.Error(h.logger).Log("msg", "Error decoding remote write request", "err", "Unsupported Content-Encoding", "contentEncoding", contentEncoding)
+		// Return a 406 so that the client can choose a more appropriate protocol to use
+		http.Error(w, "Unsupported Content-Encoding", http.StatusNotAcceptable)
+		return
+	}
+
+	// Now we have a decompressed buffer we can unmarshal it
 	// At this point we are happy with the version but need to check the encoding
-	if protoVer == RemoteWriteVersion1HeaderValue {
-		// If the version is 0.1.0 then we automatically assume Snappy encoding
-		// so we check that it is "snappy" if specified or unspecified
-		if contentEncoding != "" && contentEncoding != "snappy" {
-			level.Error(h.logger).Log("msg", "Error determining remote write request encoding", "contentEncoding", contentEncoding)
-			http.Error(w, "Error determining remote write encoding", http.StatusBadRequest)
-			return
-		}
-		req, err = DecodeWriteRequest(r.Body)
-		if err != nil {
+	switch protoVer {
+	case RemoteWriteVersion1HeaderValue:
+		var req prompb.WriteRequest
+		if err := proto.Unmarshal(decompressed, &req); err != nil {
 			level.Error(h.logger).Log("msg", "Error decoding remote write request", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		err = h.write(r.Context(), req)
-	} else {
+		err = h.write(r.Context(), &req)
+	case RemoteWriteVersion20HeaderValue:
 		// 2.0 request
-		// MUST be snappy encoded
-		if contentEncoding != "snappy" {
-			level.Error(h.logger).Log("msg", "Error determining remote write request encoding", "contentEncoding", contentEncoding)
-			http.Error(w, "Error determining remote write encoding", http.StatusNotAcceptable)
-			return
-		}
-		reqMinStr, err = DecodeMinimizedWriteRequestStr(r.Body)
-		if err != nil {
+		// ZZZ
+		var reqMinStr writev2.WriteRequest
+		if err := proto.Unmarshal(decompressed, &reqMinStr); err != nil {
 			level.Error(h.logger).Log("msg", "Error decoding remote write request", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		err = h.writeMinStr(r.Context(), reqMinStr)
+		err = h.writeMinStr(r.Context(), &reqMinStr)
 	}
 
 	switch {

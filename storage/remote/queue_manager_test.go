@@ -338,7 +338,7 @@ func TestHistogramSampleBatching(t *testing.T) {
 			mcfg := config.DefaultMetadataConfig
 
 			metrics := newQueueManagerMetrics(nil, "", "")
-			m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), tc.queueConfig, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version2, "snappy")
+			m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), tc.queueConfig, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version2)
 			m.StoreSeries(series, 0)
 
 			m.Start()
@@ -358,7 +358,7 @@ func TestMetadataDelivery(t *testing.T) {
 	mcfg := config.DefaultMetadataConfig
 
 	metrics := newQueueManagerMetrics(nil, "", "")
-	m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, 0, "snappy")
+	m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1)
 	m.Start()
 	defer m.Stop()
 
@@ -438,7 +438,7 @@ func TestSampleDeliveryTimeout(t *testing.T) {
 			dir := t.TempDir()
 
 			metrics := newQueueManagerMetrics(nil, "", "")
-			m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat, "snappy")
+			m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat)
 			m.StoreSeries(series, 0)
 			m.Start()
 			defer m.Stop()
@@ -484,7 +484,7 @@ func TestSampleDeliveryOrder(t *testing.T) {
 			mcfg := config.DefaultMetadataConfig
 
 			metrics := newQueueManagerMetrics(nil, "", "")
-			m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat, "snappy")
+			m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat)
 			m.StoreSeries(series, 0)
 
 			m.Start()
@@ -506,7 +506,7 @@ func TestShutdown(t *testing.T) {
 	mcfg := config.DefaultMetadataConfig
 	metrics := newQueueManagerMetrics(nil, "", "")
 
-	m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, deadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1, "snappy")
+	m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, deadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1)
 	n := 2 * config.DefaultQueueConfig.MaxSamplesPerSend
 	samples, series := createTimeseries(n, n)
 	m.StoreSeries(series, 0)
@@ -544,7 +544,7 @@ func TestSeriesReset(t *testing.T) {
 	cfg := testDefaultQueueConfig()
 	mcfg := config.DefaultMetadataConfig
 	metrics := newQueueManagerMetrics(nil, "", "")
-	m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, deadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1, "snappy")
+	m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, deadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1)
 	for i := 0; i < numSegments; i++ {
 		series := []record.RefSeries{}
 		for j := 0; j < numSeries; j++ {
@@ -575,7 +575,7 @@ func TestReshard(t *testing.T) {
 			dir := t.TempDir()
 
 			metrics := newQueueManagerMetrics(nil, "", "")
-			m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat, "snappy")
+			m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat)
 			m.StoreSeries(series, 0)
 
 			m.Start()
@@ -614,7 +614,7 @@ func TestReshardRaceWithStop(t *testing.T) {
 			go func() {
 				for {
 					metrics := newQueueManagerMetrics(nil, "", "")
-					m = NewQueueManager(metrics, nil, nil, nil, "", newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat, "snappy")
+					m = NewQueueManager(metrics, nil, nil, nil, "", newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat)
 					m.Start()
 					h.Unlock()
 					h.Lock()
@@ -653,7 +653,7 @@ func TestReshardPartialBatch(t *testing.T) {
 			cfg.BatchSendDeadline = model.Duration(batchSendDeadline)
 
 			metrics := newQueueManagerMetrics(nil, "", "")
-			m := NewQueueManager(metrics, nil, nil, nil, t.TempDir(), newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, flushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat, "snappy")
+			m := NewQueueManager(metrics, nil, nil, nil, t.TempDir(), newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, flushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat)
 			m.StoreSeries(series, 0)
 
 			m.Start()
@@ -702,7 +702,7 @@ func TestQueueFilledDeadlock(t *testing.T) {
 
 			metrics := newQueueManagerMetrics(nil, "", "")
 
-			m := NewQueueManager(metrics, nil, nil, nil, t.TempDir(), newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, flushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat, "snappy")
+			m := NewQueueManager(metrics, nil, nil, nil, t.TempDir(), newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, flushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat)
 			m.StoreSeries(series, 0)
 			m.Start()
 			defer m.Stop()
@@ -733,7 +733,7 @@ func TestReleaseNoninternedString(t *testing.T) {
 			mcfg := config.DefaultMetadataConfig
 			metrics := newQueueManagerMetrics(nil, "", "")
 			c := NewTestWriteClient(rwFormat)
-			m := NewQueueManager(metrics, nil, nil, nil, "", newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat, "snappy")
+			m := NewQueueManager(metrics, nil, nil, nil, "", newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, rwFormat)
 			m.Start()
 			defer m.Stop()
 			for i := 1; i < 1000; i++ {
@@ -782,7 +782,7 @@ func TestShouldReshard(t *testing.T) {
 		metrics := newQueueManagerMetrics(nil, "", "")
 		// todo: test with new proto type(s)
 		client := NewTestWriteClient(Version1)
-		m := NewQueueManager(metrics, nil, nil, nil, "", newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, client, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1, "snappy")
+		m := NewQueueManager(metrics, nil, nil, nil, "", newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, client, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1)
 		m.numShards = c.startingShards
 		m.dataIn.incr(c.samplesIn)
 		m.dataOut.incr(c.samplesOut)
@@ -1146,7 +1146,11 @@ func (c *TestWriteClient) Endpoint() string {
 }
 
 func (c *TestWriteClient) GetProtoVersions(_ context.Context) (string, error) {
-	return "2.0;snappy;,0.1.0", nil
+	return "2.0;snappy,0.1.0", nil
+}
+
+func (c *TestWriteClient) GetLastRWHeader() string {
+	return "2.0;snappy,0.1.0"
 }
 
 // TestBlockingWriteClient is a queue_manager WriteClient which will block
@@ -1180,18 +1184,24 @@ func (c *TestBlockingWriteClient) Endpoint() string {
 }
 
 func (c *TestBlockingWriteClient) GetProtoVersions(_ context.Context) (string, error) {
-	return "2.0;snappy;,0.1.0", nil
+	return "2.0;snappy,0.1.0", nil
 }
 
+func (c *TestBlockingWriteClient) GetLastRWHeader() string {
+	return "2.0;snappy,0.1.0"
+}
 
 // For benchmarking the send and not the receive side.
 type NopWriteClient struct{}
 
-func NewNopWriteClient() *NopWriteClient                           { return &NopWriteClient{} }
+func NewNopWriteClient() *NopWriteClient                                   { return &NopWriteClient{} }
 func (c *NopWriteClient) Store(context.Context, []byte, int, string) error { return nil }
-func (c *NopWriteClient) Name() string                             { return "nopwriteclient" }
-func (c *NopWriteClient) Endpoint() string                         { return "http://test-remote.com/1234" }
-func (c *NopWriteClient) GetProtoVersions(_ context.Context) (string, error) { return "2.0;snappy;,0.1.0", nil }
+func (c *NopWriteClient) Name() string                                     { return "nopwriteclient" }
+func (c *NopWriteClient) Endpoint() string                                 { return "http://test-remote.com/1234" }
+func (c *NopWriteClient) GetProtoVersions(_ context.Context) (string, error) {
+	return "2.0;snappy,0.1.0", nil
+}
+func (c *NopWriteClient) GetLastRWHeader() string { return "2.0;snappy,0.1.0" }
 
 func BenchmarkSampleSend(b *testing.B) {
 	// Send one sample per series, which is the typical remote_write case
@@ -1230,7 +1240,7 @@ func BenchmarkSampleSend(b *testing.B) {
 
 	metrics := newQueueManagerMetrics(nil, "", "")
 	// todo: test with new proto type(s)
-	m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1, "snappy")
+	m := NewQueueManager(metrics, nil, nil, nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1)
 	m.StoreSeries(series, 0)
 
 	// These should be received by the client.
@@ -1277,7 +1287,7 @@ func BenchmarkStartup(b *testing.B) {
 		// todo: test with new proto type(s)
 		m := NewQueueManager(metrics, nil, nil, logger, dir,
 			newEWMARate(ewmaWeight, shardUpdateDuration),
-			cfg, mcfg, labels.EmptyLabels(), nil, c, 1*time.Minute, newPool(), newHighestTimestampMetric(), nil, false, false, Version1, "snappy")
+			cfg, mcfg, labels.EmptyLabels(), nil, c, 1*time.Minute, newPool(), newHighestTimestampMetric(), nil, false, false, Version1)
 		m.watcher.SetStartTime(timestamp.Time(math.MaxInt64))
 		m.watcher.MaxSegment = segments[len(segments)-2]
 		err := m.watcher.Run()
@@ -1361,7 +1371,7 @@ func TestCalculateDesiredShards(t *testing.T) {
 	metrics := newQueueManagerMetrics(nil, "", "")
 	samplesIn := newEWMARate(ewmaWeight, shardUpdateDuration)
 	// todo: test with new proto type(s)
-	m := NewQueueManager(metrics, nil, nil, nil, dir, samplesIn, cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1, "snappy")
+	m := NewQueueManager(metrics, nil, nil, nil, dir, samplesIn, cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1)
 
 	// Need to start the queue manager so the proper metrics are initialized.
 	// However we can stop it right away since we don't need to do any actual
@@ -1439,7 +1449,7 @@ func TestCalculateDesiredShardsDetail(t *testing.T) {
 	metrics := newQueueManagerMetrics(nil, "", "")
 	samplesIn := newEWMARate(ewmaWeight, shardUpdateDuration)
 	// todo: test with new proto type(s)
-	m := NewQueueManager(metrics, nil, nil, nil, dir, samplesIn, cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1, "snappy")
+	m := NewQueueManager(metrics, nil, nil, nil, dir, samplesIn, cfg, mcfg, labels.EmptyLabels(), nil, c, defaultFlushDeadline, newPool(), newHighestTimestampMetric(), nil, false, false, Version1)
 
 	for _, tc := range []struct {
 		name            string

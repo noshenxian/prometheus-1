@@ -51,7 +51,7 @@ func TestRemoteWriteHeadHandler(t *testing.T) {
 
 	// Check header is expected value
 	protHeader := resp.Header.Get(RemoteWriteVersionHeader)
-	require.Equal(t, protHeader, "2.0;snappy;,0.1.0")
+	require.Equal(t, protHeader, "2.0;snappy,0.1.0")
 }
 
 func TestRemoteWriteHandlerMinimizedMissingContentEncoding(t *testing.T) {
@@ -98,7 +98,7 @@ func TestRemoteWriteHandlerInvalidCompression(t *testing.T) {
 }
 
 func TestRemoteWriteHandlerInvalidVersion(t *testing.T) {
-	// Send a protocol version number that isn't recognised/supported -> 400
+	// Send a protocol version number that isn't recognised/supported -> 406
 	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
 	require.NoError(t, err)
 
@@ -113,8 +113,8 @@ func TestRemoteWriteHandlerInvalidVersion(t *testing.T) {
 	handler.ServeHTTP(recorder, req)
 
 	resp := recorder.Result()
-	// Expect a 400 BadRequest
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	// Expect a 406
+	require.Equal(t, http.StatusNotAcceptable, resp.StatusCode)
 }
 
 func TestRemoteWriteHandler(t *testing.T) {
@@ -188,7 +188,7 @@ func TestRemoteWriteHandlerMinimizedFormat(t *testing.T) {
 
 	// Check header is expected value
 	protHeader := resp.Header.Get(RemoteWriteVersionHeader)
-	require.Equal(t, protHeader, "2.0;snappy;,0.1.0")
+	require.Equal(t, protHeader, "2.0;snappy,0.1.0")
 
 	i := 0
 	j := 0
