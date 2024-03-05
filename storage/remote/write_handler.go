@@ -21,19 +21,19 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/golang/snappy"
-	"github.com/prometheus/prometheus/model/labels"
-
-	writev2 "github.com/prometheus/prometheus/prompb/write/v2"
-
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
+
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
+	writev2 "github.com/prometheus/prometheus/prompb/write/v2"
 	"github.com/prometheus/prometheus/storage"
 	otlptranslator "github.com/prometheus/prometheus/storage/remote/otlptranslator/prometheusremotewrite"
 )
@@ -44,7 +44,7 @@ const (
 	RemoteWriteVersion20HeaderValue = "2.0"
 )
 
-func RemoteWriteHeaderNameValues(rwFormat RemoteWriteFormat) map[string]string {
+func RemoteWriteHeaderNameValues(rwFormat config.RemoteWriteFormat) map[string]string {
 	// Return the correct remote write header name/values based on provided rwFormat
 	ret := make(map[string]string, 1)
 
@@ -70,10 +70,10 @@ type writeHeadHandler struct {
 
 	// Experimental feature, new remote write proto format
 	// The handler will accept the new format, but it can still accept the old one
-	rwFormat RemoteWriteFormat
+	rwFormat config.RemoteWriteFormat
 }
 
-func NewWriteHeadHandler(logger log.Logger, reg prometheus.Registerer, rwFormat RemoteWriteFormat) http.Handler {
+func NewWriteHeadHandler(logger log.Logger, reg prometheus.Registerer, rwFormat config.RemoteWriteFormat) http.Handler {
 	h := &writeHeadHandler{
 		logger:   logger,
 		rwFormat: rwFormat,
@@ -109,12 +109,12 @@ type writeHandler struct {
 
 	// Experimental feature, new remote write proto format
 	// The handler will accept the new format, but it can still accept the old one
-	rwFormat RemoteWriteFormat
+	rwFormat config.RemoteWriteFormat
 }
 
 // NewWriteHandler creates a http.Handler that accepts remote write requests and
 // writes them to the provided appendable.
-func NewWriteHandler(logger log.Logger, reg prometheus.Registerer, appendable storage.Appendable, rwFormat RemoteWriteFormat) http.Handler {
+func NewWriteHandler(logger log.Logger, reg prometheus.Registerer, appendable storage.Appendable, rwFormat config.RemoteWriteFormat) http.Handler {
 	h := &writeHandler{
 		logger:     logger,
 		appendable: appendable,
@@ -215,7 +215,7 @@ func (h *writeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case err == nil:
-	case errors.Is(err, storage.ErrOutOfOrderSample), errors.Is(err, storage.ErrOutOfBounds), errors.Is(err, storage.ErrDuplicateSampleForTimestamp):
+	case errors.Is(err, storage.ErrOutOfOrderSample), errors.Is(err, storage.ErrOutOfBounds), errors.Is(err, storage.ErrDuplicateSampleForTimestamp), errors.Is(err, storage.ErrTooOldSample):
 		// Indicated an out of order sample is a bad request to prevent retries.
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -228,7 +228,7 @@ func (h *writeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// checkAppendExemplarError modifies the AppendExamplar's returned error based on the error cause.
+// checkAppendExemplarError modifies the AppendExemplar's returned error based on the error cause.
 func (h *writeHandler) checkAppendExemplarError(err error, e exemplar.Exemplar, outOfOrderErrs *int) error {
 	unwrappedErr := errors.Unwrap(err)
 	if unwrappedErr == nil {

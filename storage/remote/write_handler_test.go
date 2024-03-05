@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/prometheus/model/exemplar"
@@ -35,6 +36,7 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/util/testutil"
 )
 
 func TestRemoteWriteHeadHandler(t *testing.T) {
@@ -56,7 +58,7 @@ func TestRemoteWriteHeadHandler(t *testing.T) {
 
 func TestRemoteWriteHandlerMinimizedMissingContentEncoding(t *testing.T) {
 	// Send a v2 request without a "Content-Encoding:" header -> 406
-	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
+	buf, _, _, err := buildV2WriteRequest(log.NewNopLogger(), writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -78,7 +80,7 @@ func TestRemoteWriteHandlerMinimizedMissingContentEncoding(t *testing.T) {
 
 func TestRemoteWriteHandlerInvalidCompression(t *testing.T) {
 	// Send a v2 request without an unhandled compression scheme -> 406
-	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
+	buf, _, _, err := buildV2WriteRequest(log.NewNopLogger(), writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -99,11 +101,11 @@ func TestRemoteWriteHandlerInvalidCompression(t *testing.T) {
 
 func TestRemoteWriteHandlerInvalidVersion(t *testing.T) {
 	// Send a protocol version number that isn't recognised/supported -> 406
-	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
+	buf, _, _, err := buildV2WriteRequest(log.NewNopLogger(), writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
-	req.Header.Set(RemoteWriteVersionHeader, "0.3.0")
+	req.Header.Set(RemoteWriteVersionHeader, "3.0")
 	require.NoError(t, err)
 
 	appendable := &mockAppendable{}
@@ -118,7 +120,7 @@ func TestRemoteWriteHandlerInvalidVersion(t *testing.T) {
 }
 
 func TestRemoteWriteHandler(t *testing.T) {
-	buf, _, err := buildWriteRequest(writeRequestFixture.Timeseries, nil, nil, nil, "snappy")
+	buf, _, _, err := buildWriteRequest(nil, writeRequestFixture.Timeseries, nil, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -141,25 +143,25 @@ func TestRemoteWriteHandler(t *testing.T) {
 	j := 0
 	k := 0
 	for _, ts := range writeRequestFixture.Timeseries {
-		ls := labelProtosToLabels(ts.Labels)
+		labels := labelProtosToLabels(ts.Labels)
 		for _, s := range ts.Samples {
-			require.Equal(t, mockSample{ls, s.Timestamp, s.Value}, appendable.samples[i])
+			requireEqual(t, mockSample{labels, s.Timestamp, s.Value}, appendable.samples[i])
 			i++
 		}
 
 		for _, e := range ts.Exemplars {
 			exemplarLabels := labelProtosToLabels(e.Labels)
-			require.Equal(t, mockExemplar{ls, exemplarLabels, e.Timestamp, e.Value}, appendable.exemplars[j])
+			requireEqual(t, mockExemplar{labels, exemplarLabels, e.Timestamp, e.Value}, appendable.exemplars[j])
 			j++
 		}
 
 		for _, hp := range ts.Histograms {
 			if hp.IsFloatHistogram() {
 				fh := FloatHistogramProtoToFloatHistogram(hp)
-				require.Equal(t, mockHistogram{ls, hp.Timestamp, nil, fh}, appendable.histograms[k])
+				requireEqual(t, mockHistogram{labels, hp.Timestamp, nil, fh}, appendable.histograms[k])
 			} else {
 				h := HistogramProtoToHistogram(hp)
-				require.Equal(t, mockHistogram{ls, hp.Timestamp, h, nil}, appendable.histograms[k])
+				requireEqual(t, mockHistogram{labels, hp.Timestamp, h, nil}, appendable.histograms[k])
 			}
 
 			k++
@@ -168,7 +170,7 @@ func TestRemoteWriteHandler(t *testing.T) {
 }
 
 func TestRemoteWriteHandlerMinimizedFormat(t *testing.T) {
-	buf, _, err := buildMinimizedWriteRequestStr(writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, "snappy")
+	buf, _, _, err := buildV2WriteRequest(log.NewNopLogger(), writeRequestMinimizedFixture.Timeseries, writeRequestMinimizedFixture.Symbols, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -225,10 +227,10 @@ func TestRemoteWriteHandlerMinimizedFormat(t *testing.T) {
 }
 
 func TestOutOfOrderSample(t *testing.T) {
-	buf, _, err := buildWriteRequest([]prompb.TimeSeries{{
+	buf, _, _, err := buildWriteRequest(nil, []prompb.TimeSeries{{
 		Labels:  []prompb.Label{{Name: "__name__", Value: "test_metric"}},
 		Samples: []prompb.Sample{{Value: 1, Timestamp: 0}},
-	}}, nil, nil, nil, "snappy")
+	}}, nil, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -251,10 +253,10 @@ func TestOutOfOrderSample(t *testing.T) {
 // don't fail on ingestion errors since the exemplar storage is
 // still experimental.
 func TestOutOfOrderExemplar(t *testing.T) {
-	buf, _, err := buildWriteRequest([]prompb.TimeSeries{{
+	buf, _, _, err := buildWriteRequest(nil, []prompb.TimeSeries{{
 		Labels:    []prompb.Label{{Name: "__name__", Value: "test_metric"}},
 		Exemplars: []prompb.Exemplar{{Labels: []prompb.Label{{Name: "foo", Value: "bar"}}, Value: 1, Timestamp: 0}},
-	}}, nil, nil, nil, "snappy")
+	}}, nil, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -275,10 +277,10 @@ func TestOutOfOrderExemplar(t *testing.T) {
 }
 
 func TestOutOfOrderHistogram(t *testing.T) {
-	buf, _, err := buildWriteRequest([]prompb.TimeSeries{{
+	buf, _, _, err := buildWriteRequest(nil, []prompb.TimeSeries{{
 		Labels:     []prompb.Label{{Name: "__name__", Value: "test_metric"}},
 		Histograms: []prompb.Histogram{HistogramToHistogramProto(0, &testHistogram), FloatHistogramToHistogramProto(1, testHistogram.ToFloat(nil))},
-	}}, nil, nil, nil, "snappy")
+	}}, nil, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -302,13 +304,13 @@ func BenchmarkRemoteWritehandler(b *testing.B) {
 	var reqs []*http.Request
 	for i := 0; i < b.N; i++ {
 		num := strings.Repeat(strconv.Itoa(i), 16)
-		buf, _, err := buildWriteRequest([]prompb.TimeSeries{{
+		buf, _, _, err := buildWriteRequest(nil, []prompb.TimeSeries{{
 			Labels: []prompb.Label{
 				{Name: "__name__", Value: "test_metric"},
 				{Name: "test_label_name_" + num, Value: labelValue + num},
 			},
 			Histograms: []prompb.Histogram{HistogramToHistogramProto(0, &testHistogram)},
-		}}, nil, nil, nil, "snappy")
+		}}, nil, nil, nil, nil, "snappy")
 		require.NoError(b, err)
 		req, err := http.NewRequest("", "", bytes.NewReader(buf))
 		require.NoError(b, err)
@@ -327,7 +329,7 @@ func BenchmarkRemoteWritehandler(b *testing.B) {
 }
 
 func TestCommitErr(t *testing.T) {
-	buf, _, err := buildWriteRequest(writeRequestFixture.Timeseries, nil, nil, nil, "snappy")
+	buf, _, _, err := buildWriteRequest(nil, writeRequestFixture.Timeseries, nil, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -350,6 +352,7 @@ func TestCommitErr(t *testing.T) {
 }
 
 func BenchmarkRemoteWriteOOOSamples(b *testing.B) {
+	b.Skip("Not a valid benchmark (does not count to b.N)")
 	dir := b.TempDir()
 
 	opts := tsdb.DefaultOptions()
@@ -365,7 +368,7 @@ func BenchmarkRemoteWriteOOOSamples(b *testing.B) {
 	// TODO: test with other proto format(s)
 	handler := NewWriteHandler(log.NewNopLogger(), nil, db.Head(), Version1)
 
-	buf, _, err := buildWriteRequest(genSeriesWithSample(1000, 200*time.Minute.Milliseconds()), nil, nil, nil, "snappy")
+	buf, _, _, err := buildWriteRequest(nil, genSeriesWithSample(1000, 200*time.Minute.Milliseconds()), nil, nil, nil, nil, "snappy")
 	require.NoError(b, err)
 
 	req, err := http.NewRequest("", "", bytes.NewReader(buf))
@@ -378,7 +381,7 @@ func BenchmarkRemoteWriteOOOSamples(b *testing.B) {
 
 	var bufRequests [][]byte
 	for i := 0; i < 100; i++ {
-		buf, _, err = buildWriteRequest(genSeriesWithSample(1000, int64(80+i)*time.Minute.Milliseconds()), nil, nil, nil, "snappy")
+		buf, _, _, err = buildWriteRequest(nil, genSeriesWithSample(1000, int64(80+i)*time.Minute.Milliseconds()), nil, nil, nil, nil, "snappy")
 		require.NoError(b, err)
 		bufRequests = append(bufRequests, buf)
 	}
@@ -436,6 +439,13 @@ type mockHistogram struct {
 	t  int64
 	h  *histogram.Histogram
 	fh *histogram.FloatHistogram
+}
+
+// Wrapper to instruct go-cmp package to compare a list of structs with unexported fields.
+func requireEqual(t *testing.T, expected, actual interface{}, msgAndArgs ...interface{}) {
+	testutil.RequireEqualWithOptions(t, expected, actual,
+		[]cmp.Option{cmp.AllowUnexported(mockSample{}), cmp.AllowUnexported(mockExemplar{}), cmp.AllowUnexported(mockHistogram{})},
+		msgAndArgs...)
 }
 
 func (m *mockAppendable) Appender(_ context.Context) storage.Appender {

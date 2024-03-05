@@ -39,6 +39,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/prompb"
 	writev2 "github.com/prometheus/prometheus/prompb/write/v2"
 	"github.com/prometheus/prometheus/scrape"
@@ -55,6 +56,10 @@ const (
 
 	// Allow 30% too many shards before scaling down.
 	shardToleranceFraction = 0.3
+
+	reasonTooOld                     = "too_old"
+	reasonDroppedSeries              = "dropped_series"
+	reasonUnintentionalDroppedSeries = "unintentionally_dropped_series"
 )
 
 type queueManagerMetrics struct {
@@ -72,9 +77,9 @@ type queueManagerMetrics struct {
 	retriedExemplarsTotal  prometheus.Counter
 	retriedHistogramsTotal prometheus.Counter
 	retriedMetadataTotal   prometheus.Counter
-	droppedSamplesTotal    prometheus.Counter
-	droppedExemplarsTotal  prometheus.Counter
-	droppedHistogramsTotal prometheus.Counter
+	droppedSamplesTotal    *prometheus.CounterVec
+	droppedExemplarsTotal  *prometheus.CounterVec
+	droppedHistogramsTotal *prometheus.CounterVec
 	enqueueRetriesTotal    prometheus.Counter
 	sentBatchDuration      prometheus.Histogram
 	highestSentTimestamp   *maxTimestamp
@@ -184,27 +189,27 @@ func newQueueManagerMetrics(r prometheus.Registerer, rn, e string) *queueManager
 		Help:        "Total number of metadata entries which failed on send to remote storage but were retried because the send error was recoverable.",
 		ConstLabels: constLabels,
 	})
-	m.droppedSamplesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	m.droppedSamplesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace:   namespace,
 		Subsystem:   subsystem,
 		Name:        "samples_dropped_total",
-		Help:        "Total number of samples which were dropped after being read from the WAL before being sent via remote write, either via relabelling or unintentionally because of an unknown reference ID.",
+		Help:        "Total number of samples which were dropped after being read from the WAL before being sent via remote write, either via relabelling, due to being too old or unintentionally because of an unknown reference ID.",
 		ConstLabels: constLabels,
-	})
-	m.droppedExemplarsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	}, []string{"reason"})
+	m.droppedExemplarsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace:   namespace,
 		Subsystem:   subsystem,
 		Name:        "exemplars_dropped_total",
-		Help:        "Total number of exemplars which were dropped after being read from the WAL before being sent via remote write, either via relabelling or unintentionally because of an unknown reference ID.",
+		Help:        "Total number of exemplars which were dropped after being read from the WAL before being sent via remote write, either via relabelling, due to being too old or unintentionally because of an unknown reference ID.",
 		ConstLabels: constLabels,
-	})
-	m.droppedHistogramsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	}, []string{"reason"})
+	m.droppedHistogramsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace:   namespace,
 		Subsystem:   subsystem,
 		Name:        "histograms_dropped_total",
-		Help:        "Total number of histograms which were dropped after being read from the WAL before being sent via remote write, either via relabelling or unintentionally because of an unknown reference ID.",
+		Help:        "Total number of histograms which were dropped after being read from the WAL before being sent via remote write, either via relabelling, due to being too old or unintentionally because of an unknown reference ID.",
 		ConstLabels: constLabels,
-	})
+	}, []string{"reason"})
 	m.enqueueRetriesTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace:   namespace,
 		Subsystem:   subsystem,
@@ -395,18 +400,17 @@ type WriteClient interface {
 	GetLastRWHeader() string
 }
 
-type RemoteWriteFormat int64 //nolint:revive // exported.
-
 const (
-	Version1 RemoteWriteFormat = iota // 1.0, 0.1, etc.
-	Version2                          // symbols are indices into an array of strings
+	Version1 config.RemoteWriteFormat = iota // 1.0, 0.1, etc.
+	Version2                                 // symbols are indices into an array of strings
 )
 
 // QueueManager manages a queue of samples to be sent to the Storage
 // indicated by the provided WriteClient. Implements writeTo interface
 // used by WAL Watcher.
 type QueueManager struct {
-	lastSendTimestamp atomic.Int64
+	lastSendTimestamp          atomic.Int64
+	buildRequestLimitTimestamp atomic.Int64
 
 	logger               log.Logger
 	flushDeadline        time.Duration
@@ -419,16 +423,17 @@ type QueueManager struct {
 	watcher              *wlog.Watcher
 	metadataWatcher      *MetadataWatcher
 	// experimental feature, new remote write proto format and compression system in use
-	rwFormat         RemoteWriteFormat
+	rwFormat         config.RemoteWriteFormat
 	lastRWSendFormat string
 
 	clientMtx   sync.RWMutex
 	storeClient WriteClient
 
-	seriesMtx      sync.Mutex // Covers seriesLabels, seriesMetadata and droppedSeries.
+	seriesMtx      sync.Mutex // Covers seriesLabels, seriesMetadata, droppedSeries and builder.
 	seriesLabels   map[chunks.HeadSeriesRef]labels.Labels
 	seriesMetadata map[chunks.HeadSeriesRef]*metadata.Metadata
 	droppedSeries  map[chunks.HeadSeriesRef]struct{}
+	builder        *labels.Builder
 
 	seriesSegmentMtx     sync.Mutex // Covers seriesSegmentIndexes - if you also lock seriesMtx, take seriesMtx first.
 	seriesSegmentIndexes map[chunks.HeadSeriesRef]int
@@ -469,7 +474,7 @@ func NewQueueManager(
 	sm ReadyScrapeManager,
 	enableExemplarRemoteWrite bool,
 	enableNativeHistogramRemoteWrite bool,
-	rwFormat RemoteWriteFormat,
+	rwFormat config.RemoteWriteFormat,
 ) *QueueManager {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -501,6 +506,7 @@ func NewQueueManager(
 		seriesMetadata:       make(map[chunks.HeadSeriesRef]*metadata.Metadata),
 		seriesSegmentIndexes: make(map[chunks.HeadSeriesRef]int),
 		droppedSeries:        make(map[chunks.HeadSeriesRef]struct{}),
+		builder:              labels.NewBuilder(labels.EmptyLabels()),
 
 		numShards:   cfg.MinShards,
 		reshardChan: make(chan int),
@@ -576,7 +582,7 @@ func (t *QueueManager) sendMetadataWithBackoff(ctx context.Context, metadata []p
 	// Build the WriteRequest with no samples.
 	// TODO - get compression from lastRWSendFormat?
 	compression := "snappy"
-	req, _, err := buildWriteRequest(nil, metadata, pBuf, nil, compression)
+	req, _, _, err := buildWriteRequest(t.logger, nil, metadata, pBuf, nil, nil, compression)
 	if err != nil {
 		return err
 	}
@@ -622,18 +628,95 @@ func (t *QueueManager) sendMetadataWithBackoff(ctx context.Context, metadata []p
 	return nil
 }
 
+func isSampleOld(baseTime time.Time, sampleAgeLimit time.Duration, ts int64) bool {
+	if sampleAgeLimit == 0 {
+		// If sampleAgeLimit is unset, then we never skip samples due to their age.
+		return false
+	}
+	limitTs := baseTime.Add(-sampleAgeLimit)
+	sampleTs := timestamp.Time(ts)
+	return sampleTs.Before(limitTs)
+}
+
+func isTimeSeriesOldFilter(metrics *queueManagerMetrics, baseTime time.Time, sampleAgeLimit time.Duration) func(ts prompb.TimeSeries) bool {
+	return func(ts prompb.TimeSeries) bool {
+		if sampleAgeLimit == 0 {
+			// If sampleAgeLimit is unset, then we never skip samples due to their age.
+			return false
+		}
+		switch {
+		// Only the first element should be set in the series, therefore we only check the first element.
+		case len(ts.Samples) > 0:
+			if isSampleOld(baseTime, sampleAgeLimit, ts.Samples[0].Timestamp) {
+				metrics.droppedSamplesTotal.WithLabelValues(reasonTooOld).Inc()
+				return true
+			}
+		case len(ts.Histograms) > 0:
+			if isSampleOld(baseTime, sampleAgeLimit, ts.Histograms[0].Timestamp) {
+				metrics.droppedHistogramsTotal.WithLabelValues(reasonTooOld).Inc()
+				return true
+			}
+		case len(ts.Exemplars) > 0:
+			if isSampleOld(baseTime, sampleAgeLimit, ts.Exemplars[0].Timestamp) {
+				metrics.droppedExemplarsTotal.WithLabelValues(reasonTooOld).Inc()
+				return true
+			}
+		default:
+			return false
+		}
+		return false
+	}
+}
+
+func isV2TimeSeriesOldFilter(metrics *queueManagerMetrics, baseTime time.Time, sampleAgeLimit time.Duration) func(ts writev2.TimeSeries) bool {
+	return func(ts writev2.TimeSeries) bool {
+		if sampleAgeLimit == 0 {
+			// If sampleAgeLimit is unset, then we never skip samples due to their age.
+			return false
+		}
+		switch {
+		// Only the first element should be set in the series, therefore we only check the first element.
+		case len(ts.Samples) > 0:
+			if isSampleOld(baseTime, sampleAgeLimit, ts.Samples[0].Timestamp) {
+				metrics.droppedSamplesTotal.WithLabelValues(reasonTooOld).Inc()
+				return true
+			}
+		case len(ts.Histograms) > 0:
+			if isSampleOld(baseTime, sampleAgeLimit, ts.Histograms[0].Timestamp) {
+				metrics.droppedHistogramsTotal.WithLabelValues(reasonTooOld).Inc()
+				return true
+			}
+		case len(ts.Exemplars) > 0:
+			if isSampleOld(baseTime, sampleAgeLimit, ts.Exemplars[0].Timestamp) {
+				metrics.droppedExemplarsTotal.WithLabelValues(reasonTooOld).Inc()
+				return true
+			}
+		default:
+			return false
+		}
+		return false
+	}
+}
+
 // Append queues a sample to be sent to the remote storage. Blocks until all samples are
 // enqueued on their shards or a shutdown signal is received.
 func (t *QueueManager) Append(samples []record.RefSample) bool {
+	currentTime := time.Now()
 outer:
 	for _, s := range samples {
+		if isSampleOld(currentTime, time.Duration(t.cfg.SampleAgeLimit), s.T) {
+			t.metrics.droppedSamplesTotal.WithLabelValues(reasonTooOld).Inc()
+			continue
+		}
 		t.seriesMtx.Lock()
 		lbls, ok := t.seriesLabels[s.Ref]
 		if !ok {
-			t.metrics.droppedSamplesTotal.Inc()
 			t.dataDropped.incr(1)
 			if _, ok := t.droppedSeries[s.Ref]; !ok {
 				level.Info(t.logger).Log("msg", "Dropped sample for series that was not explicitly dropped via relabelling", "ref", s.Ref)
+				t.metrics.droppedSamplesTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
+			} else {
+				t.metrics.droppedSamplesTotal.WithLabelValues(reasonDroppedSeries).Inc()
 			}
 			t.seriesMtx.Unlock()
 			continue
@@ -679,17 +762,23 @@ func (t *QueueManager) AppendExemplars(exemplars []record.RefExemplar) bool {
 	if !t.sendExemplars {
 		return true
 	}
-
+	currentTime := time.Now()
 outer:
 	for _, e := range exemplars {
+		if isSampleOld(currentTime, time.Duration(t.cfg.SampleAgeLimit), e.T) {
+			t.metrics.droppedExemplarsTotal.WithLabelValues(reasonTooOld).Inc()
+			continue
+		}
 		t.seriesMtx.Lock()
 		lbls, ok := t.seriesLabels[e.Ref]
 		if !ok {
-			t.metrics.droppedExemplarsTotal.Inc()
 			// Track dropped exemplars in the same EWMA for sharding calc.
 			t.dataDropped.incr(1)
 			if _, ok := t.droppedSeries[e.Ref]; !ok {
 				level.Info(t.logger).Log("msg", "Dropped exemplar for series that was not explicitly dropped via relabelling", "ref", e.Ref)
+				t.metrics.droppedExemplarsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
+			} else {
+				t.metrics.droppedExemplarsTotal.WithLabelValues(reasonDroppedSeries).Inc()
 			}
 			t.seriesMtx.Unlock()
 			continue
@@ -730,16 +819,22 @@ func (t *QueueManager) AppendHistograms(histograms []record.RefHistogramSample) 
 	if !t.sendNativeHistograms {
 		return true
 	}
-
+	currentTime := time.Now()
 outer:
 	for _, h := range histograms {
+		if isSampleOld(currentTime, time.Duration(t.cfg.SampleAgeLimit), h.T) {
+			t.metrics.droppedHistogramsTotal.WithLabelValues(reasonTooOld).Inc()
+			continue
+		}
 		t.seriesMtx.Lock()
 		lbls, ok := t.seriesLabels[h.Ref]
 		if !ok {
-			t.metrics.droppedHistogramsTotal.Inc()
 			t.dataDropped.incr(1)
 			if _, ok := t.droppedSeries[h.Ref]; !ok {
 				level.Info(t.logger).Log("msg", "Dropped histogram for series that was not explicitly dropped via relabelling", "ref", h.Ref)
+				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
+			} else {
+				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonDroppedSeries).Inc()
 			}
 			t.seriesMtx.Unlock()
 			continue
@@ -779,16 +874,22 @@ func (t *QueueManager) AppendFloatHistograms(floatHistograms []record.RefFloatHi
 	if !t.sendNativeHistograms {
 		return true
 	}
-
+	currentTime := time.Now()
 outer:
 	for _, h := range floatHistograms {
+		if isSampleOld(currentTime, time.Duration(t.cfg.SampleAgeLimit), h.T) {
+			t.metrics.droppedHistogramsTotal.WithLabelValues(reasonTooOld).Inc()
+			continue
+		}
 		t.seriesMtx.Lock()
 		lbls, ok := t.seriesLabels[h.Ref]
 		if !ok {
-			t.metrics.droppedHistogramsTotal.Inc()
 			t.dataDropped.incr(1)
 			if _, ok := t.droppedSeries[h.Ref]; !ok {
 				level.Info(t.logger).Log("msg", "Dropped histogram for series that was not explicitly dropped via relabelling", "ref", h.Ref)
+				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
+			} else {
+				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonDroppedSeries).Inc()
 			}
 			t.seriesMtx.Unlock()
 			continue
@@ -882,12 +983,14 @@ func (t *QueueManager) StoreSeries(series []record.RefSeries, index int) {
 		// Just make sure all the Refs of Series will insert into seriesSegmentIndexes map for tracking.
 		t.seriesSegmentIndexes[s.Ref] = index
 
-		ls := processExternalLabels(s.Labels, t.externalLabels)
-		lbls, keep := relabel.Process(ls, t.relabelConfigs...)
-		if !keep || lbls.IsEmpty() {
+		t.builder.Reset(s.Labels)
+		processExternalLabels(t.builder, t.externalLabels)
+		keep := relabel.ProcessBuilder(t.builder, t.relabelConfigs...)
+		if !keep {
 			t.droppedSeries[s.Ref] = struct{}{}
 			continue
 		}
+		lbls := t.builder.Labels()
 		t.internLabels(lbls)
 
 		// We should not ever be replacing a series labels in the map, but just
@@ -970,30 +1073,14 @@ func (t *QueueManager) releaseLabels(ls labels.Labels) {
 	ls.ReleaseStrings(t.interner.release)
 }
 
-// processExternalLabels merges externalLabels into ls. If ls contains
-// a label in externalLabels, the value in ls wins.
-func processExternalLabels(ls labels.Labels, externalLabels []labels.Label) labels.Labels {
-	if len(externalLabels) == 0 {
-		return ls
-	}
-
-	b := labels.NewScratchBuilder(ls.Len() + len(externalLabels))
-	j := 0
-	ls.Range(func(l labels.Label) {
-		for j < len(externalLabels) && l.Name > externalLabels[j].Name {
-			b.Add(externalLabels[j].Name, externalLabels[j].Value)
-			j++
+// processExternalLabels merges externalLabels into b. If b contains
+// a label in externalLabels, the value in b wins.
+func processExternalLabels(b *labels.Builder, externalLabels []labels.Label) {
+	for _, el := range externalLabels {
+		if b.Get(el.Name) == "" {
+			b.Set(el.Name, el.Value)
 		}
-		if j < len(externalLabels) && l.Name == externalLabels[j].Name {
-			j++
-		}
-		b.Add(l.Name, l.Value)
-	})
-	for ; j < len(externalLabels); j++ {
-		b.Add(externalLabels[j].Name, externalLabels[j].Value)
 	}
-
-	return b.Labels()
 }
 
 func (t *QueueManager) updateShardsLoop() {
@@ -1414,7 +1501,7 @@ func (q *queue) newBatch(capacity int) []timeSeries {
 	return make([]timeSeries, 0, capacity)
 }
 
-func negotiateRWProto(rwFormat RemoteWriteFormat, lastHeaderSeen string) (string, RemoteWriteFormat) {
+func negotiateRWProto(rwFormat config.RemoteWriteFormat, lastHeaderSeen string) (string, config.RemoteWriteFormat) {
 	if rwFormat == Version1 {
 		// If we're only handling Version1 then all we can do is that with snappy compression
 		return "snappy", Version1
@@ -1531,8 +1618,8 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 			case Version1:
 				nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 				n := nPendingSamples + nPendingExemplars + nPendingHistograms
-				// TODO - do something with return code of s.sendV1Samples() in case it is a 406
-				s.sendV1Samples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
+				// TODO - do something with return code of s.sendSamples() in case it is a 406
+				s.sendSamples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
 			case Version2:
 				nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := populateV2TimeSeries(&symbolTable, batch, pendingMinStrData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 				n := nPendingSamples + nPendingExemplars + nPendingHistograms
@@ -1556,8 +1643,8 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 				case Version1:
 					nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
 					n := nPendingSamples + nPendingExemplars + nPendingHistograms
-					// TODO - do something with return code of s.sendV1Samples() in case it is a 406
-					s.sendV1Samples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
+					// TODO - do something with return code of s.sendSamples() in case it is a 406
+					s.sendSamples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
 					level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending buffered data", "samples", nPendingSamples,
 						"exemplars", nPendingExemplars, "shard", shardNum, "histograms", nPendingHistograms)
 				case Version2:
@@ -1615,15 +1702,9 @@ func populateTimeSeries(batch []timeSeries, pendingData []prompb.TimeSeries, sen
 	return nPendingSamples, nPendingExemplars, nPendingHistograms
 }
 
-func (s *shards) sendV1Samples(ctx context.Context, series []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount int, pBuf *proto.Buffer, buf *[]byte, compression string) error {
+func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount int, pBuf *proto.Buffer, buf *[]byte, compression string) error {
 	begin := time.Now()
-	// Build the WriteRequest with no metadata.
-	// Failing to build the write request is non-recoverable, since it will
-	// only error if marshaling the proto to bytes fails.
-	req, highest, err := buildWriteRequest(series, nil, pBuf, buf, compression)
-	if err == nil {
-		err = s.sendSamplesWithBackoff(ctx, req, sampleCount, exemplarCount, histogramCount, 0, highest, compression)
-	}
+	err := s.sendSamplesWithBackoff(ctx, samples, sampleCount, exemplarCount, histogramCount, 0, pBuf, buf, compression)
 	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, 0, time.Since(begin))
 
 	// Return the error in case it is a 406 and we need to reformat the data
@@ -1632,10 +1713,7 @@ func (s *shards) sendV1Samples(ctx context.Context, series []prompb.TimeSeries, 
 
 func (s *shards) sendV2Samples(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte, compression string) error {
 	begin := time.Now()
-	req, highest, err := buildMinimizedWriteRequestStr(samples, labels, pBuf, buf, compression)
-	if err == nil {
-		err = s.sendSamplesWithBackoff(ctx, req, sampleCount, exemplarCount, histogramCount, metadataCount, highest, compression)
-	}
+	err := s.sendV2SamplesWithBackoff(ctx, samples, labels, sampleCount, exemplarCount, histogramCount, metadataCount, pBuf, buf, compression)
 	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, metadataCount, time.Since(begin))
 
 	// Return the error in case it is a 406 and we need to reformat the data
@@ -1666,13 +1744,43 @@ func (s *shards) updateMetrics(ctx context.Context, err error, sampleCount, exem
 }
 
 // sendSamples to the remote storage with backoff for recoverable errors.
-func (s *shards) sendSamplesWithBackoff(ctx context.Context, rawReq []byte, sampleCount, exemplarCount, histogramCount, metadataCount int, highestTimestamp int64, compression string) error {
-	reqSize := len(rawReq)
+func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf *proto.Buffer, buf *[]byte, compression string) error {
+	// Build the WriteRequest with no metadata.
+	req, highest, lowest, err := buildWriteRequest(s.qm.logger, samples, nil, pBuf, buf, nil, compression)
+	s.qm.buildRequestLimitTimestamp.Store(lowest)
+	if err != nil {
+		// Failing to build the write request is non-recoverable, since it will
+		// only error if marshaling the proto to bytes fails.
+		return err
+	}
+
+	reqSize := len(req)
+	*buf = req
 
 	// An anonymous function allows us to defer the completion of our per-try spans
 	// without causing a memory leak, and it has the nice effect of not propagating any
 	// parameters for sendSamplesWithBackoff/3.
 	attemptStore := func(try int) error {
+		currentTime := time.Now()
+		lowest := s.qm.buildRequestLimitTimestamp.Load()
+		if isSampleOld(currentTime, time.Duration(s.qm.cfg.SampleAgeLimit), lowest) {
+			// This will filter out old samples during retries.
+			req, _, lowest, err := buildWriteRequest(
+				s.qm.logger,
+				samples,
+				nil,
+				pBuf,
+				buf,
+				isTimeSeriesOldFilter(s.qm.metrics, currentTime, time.Duration(s.qm.cfg.SampleAgeLimit)),
+				compression,
+			)
+			s.qm.buildRequestLimitTimestamp.Store(lowest)
+			if err != nil {
+				return err
+			}
+			*buf = req
+		}
+
 		ctx, span := otel.Tracer("").Start(ctx, "Remote Send Batch")
 		defer span.End()
 
@@ -1696,7 +1804,7 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, rawReq []byte, samp
 		s.qm.metrics.exemplarsTotal.Add(float64(exemplarCount))
 		s.qm.metrics.histogramsTotal.Add(float64(histogramCount))
 		s.qm.metrics.metadataTotal.Add(float64(metadataCount))
-		err := s.qm.client().Store(ctx, rawReq, try, compression)
+		err := s.qm.client().Store(ctx, *buf, try, compression)
 		s.qm.metrics.sentBatchDuration.Observe(time.Since(begin).Seconds())
 
 		if err != nil {
@@ -1713,7 +1821,7 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, rawReq []byte, samp
 		s.qm.metrics.retriedHistogramsTotal.Add(float64(histogramCount))
 	}
 
-	err := sendWriteRequestWithBackoff(ctx, s.qm.cfg, s.qm.logger, attemptStore, onRetry)
+	err = sendWriteRequestWithBackoff(ctx, s.qm.cfg, s.qm.logger, attemptStore, onRetry)
 	if errors.Is(err, context.Canceled) {
 		// When there is resharding, we cancel the context for this queue, which means the data is not sent.
 		// So we exit early to not update the metrics.
@@ -1721,7 +1829,98 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, rawReq []byte, samp
 	}
 
 	s.qm.metrics.sentBytesTotal.Add(float64(reqSize))
-	s.qm.metrics.highestSentTimestamp.Set(float64(highestTimestamp / 1000))
+	s.qm.metrics.highestSentTimestamp.Set(float64(highest / 1000))
+
+	return err
+}
+
+// sendV2Samples to the remote storage with backoff for recoverable errors.
+func (s *shards) sendV2SamplesWithBackoff(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte, compression string) error {
+	// Build the WriteRequest with no metadata.
+	req, highest, lowest, err := buildV2WriteRequest(s.qm.logger, samples, labels, pBuf, buf, nil, compression)
+	s.qm.buildRequestLimitTimestamp.Store(lowest)
+	if err != nil {
+		// Failing to build the write request is non-recoverable, since it will
+		// only error if marshaling the proto to bytes fails.
+		return err
+	}
+
+	reqSize := len(req)
+	*buf = req
+
+	// An anonymous function allows us to defer the completion of our per-try spans
+	// without causing a memory leak, and it has the nice effect of not propagating any
+	// parameters for sendSamplesWithBackoff/3.
+	attemptStore := func(try int) error {
+		currentTime := time.Now()
+		lowest := s.qm.buildRequestLimitTimestamp.Load()
+		if isSampleOld(currentTime, time.Duration(s.qm.cfg.SampleAgeLimit), lowest) {
+			// This will filter out old samples during retries.
+			req, _, lowest, err := buildV2WriteRequest(
+				s.qm.logger,
+				samples,
+				labels,
+				pBuf,
+				buf,
+				isV2TimeSeriesOldFilter(s.qm.metrics, currentTime, time.Duration(s.qm.cfg.SampleAgeLimit)),
+				compression,
+			)
+			s.qm.buildRequestLimitTimestamp.Store(lowest)
+			if err != nil {
+				return err
+			}
+			*buf = req
+		}
+
+		ctx, span := otel.Tracer("").Start(ctx, "Remote Send Batch")
+		defer span.End()
+
+		span.SetAttributes(
+			attribute.Int("request_size", reqSize),
+			attribute.Int("samples", sampleCount),
+			attribute.Int("try", try),
+			attribute.String("remote_name", s.qm.storeClient.Name()),
+			attribute.String("remote_url", s.qm.storeClient.Endpoint()),
+		)
+
+		if exemplarCount > 0 {
+			span.SetAttributes(attribute.Int("exemplars", exemplarCount))
+		}
+		if histogramCount > 0 {
+			span.SetAttributes(attribute.Int("histograms", histogramCount))
+		}
+
+		begin := time.Now()
+		s.qm.metrics.samplesTotal.Add(float64(sampleCount))
+		s.qm.metrics.exemplarsTotal.Add(float64(exemplarCount))
+		s.qm.metrics.histogramsTotal.Add(float64(histogramCount))
+		s.qm.metrics.metadataTotal.Add(float64(metadataCount))
+		err := s.qm.client().Store(ctx, *buf, try, compression)
+		s.qm.metrics.sentBatchDuration.Observe(time.Since(begin).Seconds())
+
+		if err != nil {
+			span.RecordError(err)
+			return err
+		}
+
+		return nil
+	}
+
+	onRetry := func() {
+		s.qm.metrics.retriedSamplesTotal.Add(float64(sampleCount))
+		s.qm.metrics.retriedExemplarsTotal.Add(float64(exemplarCount))
+		s.qm.metrics.retriedHistogramsTotal.Add(float64(histogramCount))
+	}
+
+	err = sendWriteRequestWithBackoff(ctx, s.qm.cfg, s.qm.logger, attemptStore, onRetry)
+	if errors.Is(err, context.Canceled) {
+		// When there is resharding, we cancel the context for this queue, which means the data is not sent.
+		// So we exit early to not update the metrics.
+		return err
+	}
+
+	s.qm.metrics.sentBytesTotal.Add(float64(reqSize))
+	s.qm.metrics.highestSentTimestamp.Set(float64(highest / 1000))
 
 	return err
 }
@@ -1831,9 +2030,27 @@ func sendWriteRequestWithBackoff(ctx context.Context, cfg config.QueueConfig, l 
 	}
 }
 
-func buildWriteRequest(samples []prompb.TimeSeries, metadata []prompb.MetricMetadata, pBuf *proto.Buffer, buf *[]byte, compression string) ([]byte, int64, error) {
+func buildTimeSeries(timeSeries []prompb.TimeSeries, filter func(prompb.TimeSeries) bool) (int64, int64, []prompb.TimeSeries, int, int, int) {
 	var highest int64
-	for _, ts := range samples {
+	var lowest int64
+	var droppedSamples, droppedExemplars, droppedHistograms int
+
+	keepIdx := 0
+	lowest = math.MaxInt64
+	for i, ts := range timeSeries {
+		if filter != nil && filter(ts) {
+			if len(ts.Samples) > 0 {
+				droppedSamples++
+			}
+			if len(ts.Exemplars) > 0 {
+				droppedExemplars++
+			}
+			if len(ts.Histograms) > 0 {
+				droppedHistograms++
+			}
+			continue
+		}
+
 		// At the moment we only ever append a TimeSeries with a single sample or exemplar in it.
 		if len(ts.Samples) > 0 && ts.Samples[0].Timestamp > highest {
 			highest = ts.Samples[0].Timestamp
@@ -1844,10 +2061,37 @@ func buildWriteRequest(samples []prompb.TimeSeries, metadata []prompb.MetricMeta
 		if len(ts.Histograms) > 0 && ts.Histograms[0].Timestamp > highest {
 			highest = ts.Histograms[0].Timestamp
 		}
+
+		// Get lowest timestamp
+		if len(ts.Samples) > 0 && ts.Samples[0].Timestamp < lowest {
+			lowest = ts.Samples[0].Timestamp
+		}
+		if len(ts.Exemplars) > 0 && ts.Exemplars[0].Timestamp < lowest {
+			lowest = ts.Exemplars[0].Timestamp
+		}
+		if len(ts.Histograms) > 0 && ts.Histograms[0].Timestamp < lowest {
+			lowest = ts.Histograms[0].Timestamp
+		}
+
+		// Move the current element to the write position and increment the write pointer
+		timeSeries[keepIdx] = timeSeries[i]
+		keepIdx++
+	}
+
+	timeSeries = timeSeries[:keepIdx]
+	return highest, lowest, timeSeries, droppedSamples, droppedExemplars, droppedHistograms
+}
+
+func buildWriteRequest(logger log.Logger, timeSeries []prompb.TimeSeries, metadata []prompb.MetricMetadata, pBuf *proto.Buffer, buf *[]byte, filter func(prompb.TimeSeries) bool, compression string) ([]byte, int64, int64, error) {
+	highest, lowest, timeSeries,
+		droppedSamples, droppedExemplars, droppedHistograms := buildTimeSeries(timeSeries, filter)
+
+	if droppedSamples > 0 || droppedExemplars > 0 || droppedHistograms > 0 {
+		level.Debug(logger).Log("msg", "dropped data due to their age", "droppedSamples", droppedSamples, "droppedExemplars", droppedExemplars, "droppedHistograms", droppedHistograms)
 	}
 
 	req := &prompb.WriteRequest{
-		Timeseries: samples,
+		Timeseries: timeSeries,
 		Metadata:   metadata,
 	}
 
@@ -1858,7 +2102,7 @@ func buildWriteRequest(samples []prompb.TimeSeries, metadata []prompb.MetricMeta
 	}
 	err := pBuf.Marshal(req)
 	if err != nil {
-		return nil, highest, err
+		return nil, highest, lowest, err
 	}
 
 	// snappy uses len() to see if it needs to allocate a new slice. Make the
@@ -1879,10 +2123,9 @@ func buildWriteRequest(samples []prompb.TimeSeries, metadata []prompb.MetricMeta
 			*buf = make([]byte, n)
 		}
 	default:
-		return nil, highest, fmt.Errorf("Unknown compression scheme [%s]", compression)
+		return nil, highest, lowest, fmt.Errorf("Unknown compression scheme [%s]", compression)
 	}
-
-	return compressed, highest, nil
+	return compressed, highest, lowest, nil
 }
 
 type rwSymbolTable struct {
@@ -1917,24 +2160,16 @@ func (r *rwSymbolTable) clear() {
 	}
 }
 
-func buildMinimizedWriteRequestStr(samples []writev2.TimeSeries, labels []string, pBuf, buf *[]byte, compression string) ([]byte, int64, error) {
-	var highest int64
-	for _, ts := range samples {
-		// At the moment we only ever append a TimeSeries with a single sample or exemplar in it.
-		if len(ts.Samples) > 0 && ts.Samples[0].Timestamp > highest {
-			highest = ts.Samples[0].Timestamp
-		}
-		if len(ts.Exemplars) > 0 && ts.Exemplars[0].Timestamp > highest {
-			highest = ts.Exemplars[0].Timestamp
-		}
-		if len(ts.Histograms) > 0 && ts.Histograms[0].Timestamp > highest {
-			highest = ts.Histograms[0].Timestamp
-		}
+func buildV2WriteRequest(logger log.Logger, samples []writev2.TimeSeries, labels []string, pBuf, buf *[]byte, filter func(writev2.TimeSeries) bool, compression string) ([]byte, int64, int64, error) {
+	highest, lowest, timeSeries, droppedSamples, droppedExemplars, droppedHistograms := buildV2TimeSeries(samples, filter)
+
+	if droppedSamples > 0 || droppedExemplars > 0 || droppedHistograms > 0 {
+		level.Debug(logger).Log("msg", "dropped data due to their age", "droppedSamples", droppedSamples, "droppedExemplars", droppedExemplars, "droppedHistograms", droppedHistograms)
 	}
 
 	req := &writev2.WriteRequest{
 		Symbols:    labels,
-		Timeseries: samples,
+		Timeseries: timeSeries,
 	}
 
 	if pBuf == nil {
@@ -1943,7 +2178,7 @@ func buildMinimizedWriteRequestStr(samples []writev2.TimeSeries, labels []string
 
 	data, err := req.OptimizedMarshal(*pBuf)
 	if err != nil {
-		return nil, 0, err
+		return nil, highest, lowest, err
 	}
 	*pBuf = data
 
@@ -1965,8 +2200,60 @@ func buildMinimizedWriteRequestStr(samples []writev2.TimeSeries, labels []string
 			*buf = make([]byte, n)
 		}
 	default:
-		return nil, highest, fmt.Errorf("Unknown compression scheme [%s]", compression)
+		return nil, highest, lowest, fmt.Errorf("Unknown compression scheme [%s]", compression)
 	}
 
-	return compressed, highest, nil
+	return compressed, highest, lowest, nil
+}
+
+func buildV2TimeSeries(timeSeries []writev2.TimeSeries, filter func(writev2.TimeSeries) bool) (int64, int64, []writev2.TimeSeries, int, int, int) {
+	var highest int64
+	var lowest int64
+	var droppedSamples, droppedExemplars, droppedHistograms int
+
+	keepIdx := 0
+	lowest = math.MaxInt64
+	for i, ts := range timeSeries {
+		if filter != nil && filter(ts) {
+			if len(ts.Samples) > 0 {
+				droppedSamples++
+			}
+			if len(ts.Exemplars) > 0 {
+				droppedExemplars++
+			}
+			if len(ts.Histograms) > 0 {
+				droppedHistograms++
+			}
+			continue
+		}
+
+		// At the moment we only ever append a TimeSeries with a single sample or exemplar in it.
+		if len(ts.Samples) > 0 && ts.Samples[0].Timestamp > highest {
+			highest = ts.Samples[0].Timestamp
+		}
+		if len(ts.Exemplars) > 0 && ts.Exemplars[0].Timestamp > highest {
+			highest = ts.Exemplars[0].Timestamp
+		}
+		if len(ts.Histograms) > 0 && ts.Histograms[0].Timestamp > highest {
+			highest = ts.Histograms[0].Timestamp
+		}
+
+		// Get lowest timestamp
+		if len(ts.Samples) > 0 && ts.Samples[0].Timestamp < lowest {
+			lowest = ts.Samples[0].Timestamp
+		}
+		if len(ts.Exemplars) > 0 && ts.Exemplars[0].Timestamp < lowest {
+			lowest = ts.Exemplars[0].Timestamp
+		}
+		if len(ts.Histograms) > 0 && ts.Histograms[0].Timestamp < lowest {
+			lowest = ts.Histograms[0].Timestamp
+		}
+
+		// Move the current element to the write position and increment the write pointer
+		timeSeries[keepIdx] = timeSeries[i]
+		keepIdx++
+	}
+
+	timeSeries = timeSeries[:keepIdx]
+	return highest, lowest, timeSeries, droppedSamples, droppedExemplars, droppedHistograms
 }
