@@ -194,21 +194,20 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 
 		// Work out what protocol and compression to use for this endpoint
 		// Default to blank string, which means we haven't been able to work it out
-		lastRWProtoHeader := ""
-		lastRWProtoHeader = lastRWProtoHeader + "argle"
 		rwFormat := Version1
 		switch rwConf.ProtocolVersion {
 		case Version1:
 			// We use the standard value as there's no negotiation to be had
-			lastRWProtoHeader = RemoteWriteVersion1HeaderValue
 		case Version2:
 			// If this newer remote write format is enabled then we need to go do a HEAD
 			// to work out the desired protocol version and compressions
+			// The value of the header is kept in the client so no need to see it here
 			rwFormat = Version2
-			lastRWProtoHeader, err = c.GetProtoVersions(context.Background()) // TODO - better ctx to pass?
+			_, err := c.GetProtoVersions(context.Background()) // TODO - better ctx to pass?
 			if err != nil {
 				// TODO - Log an error based on this?
 				// TODO - if we get 405 (MethodNotAllowed) then we should default to 1.0 (and downgrade rwFormat)
+				// Also see if we need to use lastRWProtoHeader (first return val of GetProtoVersions()) here
 			}
 			// Regardless of what we get back in from GetProtoVersions() we use the value as it overrides
 			// the default blank string

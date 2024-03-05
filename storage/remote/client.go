@@ -200,7 +200,7 @@ type RecoverableError struct {
 	retryAfter model.Duration
 }
 
-// Attempt a HEAD request against a remote write endpoint to see what it supports
+// Attempt a HEAD request against a remote write endpoint to see what it supports.
 func (c *Client) GetProtoVersions(ctx context.Context) (string, error) {
 	// If we are in Version1 mode then don't even bother
 	if c.rwFormat == Version1 {
@@ -247,7 +247,6 @@ func (c *Client) GetProtoVersions(ctx context.Context) (string, error) {
 // Store sends a batch of samples to the HTTP endpoint, the request is the proto marshalled
 // and encoded bytes from codec.go.
 func (c *Client) Store(ctx context.Context, req []byte, attempt int, compression string) error {
-
 	httpReq, err := http.NewRequest("POST", c.urlString, bytes.NewReader(req))
 	if err != nil {
 		// Errors from NewRequest are from unparsable URLs, so are not
