@@ -497,7 +497,7 @@ func NewQueueManager(
 		storeClient:          client,
 		sendExemplars:        enableExemplarRemoteWrite,
 		sendNativeHistograms: enableNativeHistogramRemoteWrite,
-		// TODO: we should eventually set the format via content negotiation,
+		// TODO(alexg): we should eventually set the format via content negotiation,
 		// so this field would be the desired format, maybe with a fallback?
 		rwFormat:         rwFormat,
 		lastRWSendFormat: "",
@@ -580,7 +580,7 @@ func (t *QueueManager) AppendWatcherMetadata(ctx context.Context, metadata []scr
 
 func (t *QueueManager) sendMetadataWithBackoff(ctx context.Context, metadata []prompb.MetricMetadata, pBuf *proto.Buffer) error {
 	// Build the WriteRequest with no samples.
-	// TODO - get compression from lastRWSendFormat?
+	// TODO(alexg) - get compression from lastRWSendFormat?
 	compression := "snappy"
 	req, _, _, err := buildWriteRequest(t.logger, nil, metadata, pBuf, nil, nil, compression)
 	if err != nil {
@@ -1514,7 +1514,7 @@ func negotiateRWProto(rwFormat config.RemoteWriteFormat, lastHeaderSeen string) 
 	}
 	if lastHeaderSeen == "" {
 		// We haven't had a valid header, so we just default to 0.1.0/snappy
-		// TODO - Log something here?
+		// TODO(alexg) - Log something here?
 		return "snappy", Version1
 	}
 	// We can currently handle:
@@ -1532,7 +1532,7 @@ func negotiateRWProto(rwFormat config.RemoteWriteFormat, lastHeaderSeen string) 
 			return "snappy", Version1
 		}
 	}
-	// TODO - Log something here?
+	// TODO(alexg) - Log something here?
 
 	// Otherwise we have to default to "0.1.0;/snappy"
 	return "snappy", Version1
@@ -1588,6 +1588,28 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 	}
 	defer stop()
 
+	attemptBatchSend := func(batch []timeSeries, rwFormat config.RemoteWriteFormat, compression string, timer bool) error {
+		switch rwFormat {
+		case Version1:
+			nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
+			n := nPendingSamples + nPendingExemplars + nPendingHistograms
+			if timer {
+				level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending buffered data", "samples", nPendingSamples,
+					"exemplars", nPendingExemplars, "shard", shardNum, "histograms", nPendingHistograms)
+			}
+			return s.sendSamples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
+		case Version2:
+			nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := populateV2TimeSeries(&symbolTable, batch, pendingMinStrData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
+			n := nPendingSamples + nPendingExemplars + nPendingHistograms
+			err := s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf, compression)
+			symbolTable.clear()
+			return err
+		}
+		return nil
+	}
+
+	// TODO(alexg) - do something with return code of s.sendV2Samples() in case it is a 406
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1611,21 +1633,24 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 			if !ok {
 				return
 			}
+			// Resend logic on 406
+			// ErrStatusNotAccepted is a new error defined in client.go
+
 			// Work out what version to send based on the last header seen and the QM's rwFormat setting
-			lastHeaderSeen := s.qm.storeClient.GetLastRWHeader()
-			compression, rwFormat := negotiateRWProto(s.qm.rwFormat, lastHeaderSeen)
-			switch rwFormat {
-			case Version1:
-				nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
-				n := nPendingSamples + nPendingExemplars + nPendingHistograms
-				// TODO - do something with return code of s.sendSamples() in case it is a 406
-				_ = s.sendSamples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
-			case Version2:
-				nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := populateV2TimeSeries(&symbolTable, batch, pendingMinStrData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
-				n := nPendingSamples + nPendingExemplars + nPendingHistograms
-				// TODO - do something with return code of s.sendV2Samples() in case it is a 406
-				_ = s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf, compression)
-				symbolTable.clear()
+			// TODO(alexg) loop here
+			// TODO(alexg) better checks here, we want to stop doing the same thing more than once
+			// TODO(alexg) or avoid looping unnecessarily, ideas?
+			for attemptNos := 1 ; attemptNos <= 3; attemptNos++ {
+				lastHeaderSeen := s.qm.storeClient.GetLastRWHeader()
+				compression, rwFormat := negotiateRWProto(s.qm.rwFormat, lastHeaderSeen)
+				sendErr := attemptBatchSend(batch, rwFormat, compression, false)
+				if sendErr != nil && errors.Is(sendErr, ErrStatusNotAccepted) {
+					// TODO(alexg) log something?
+					// just loop again and hope it works?
+				} else {
+					// It wasn't an error, or wasn't a 406 so we can just stop trying
+					break
+				}
 			}
 
 			queue.ReturnForReuse(batch)
@@ -1638,22 +1663,10 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 			if len(batch) > 0 {
 				// Work out what version to send based on the last header seen and the QM's rwFormat setting
 				lastHeaderSeen := s.qm.storeClient.GetLastRWHeader()
+				// TODO(alexg) copy eventual loop logic here from case above
 				compression, rwFormat := negotiateRWProto(s.qm.rwFormat, lastHeaderSeen)
-				switch rwFormat {
-				case Version1:
-					nPendingSamples, nPendingExemplars, nPendingHistograms := populateTimeSeries(batch, pendingData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
-					n := nPendingSamples + nPendingExemplars + nPendingHistograms
-					// TODO - do something with return code of s.sendSamples() in case it is a 406
-					_ = s.sendSamples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf, compression)
-					level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending buffered data", "samples", nPendingSamples,
-						"exemplars", nPendingExemplars, "shard", shardNum, "histograms", nPendingHistograms)
-				case Version2:
-					nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := populateV2TimeSeries(&symbolTable, batch, pendingMinStrData, s.qm.sendExemplars, s.qm.sendNativeHistograms)
-					n := nPendingSamples + nPendingExemplars + nPendingHistograms
-					// TODO - do something with return code of s.sendV2Samples() in case it is a 406
-					_ = s.sendV2Samples(ctx, pendingMinStrData[:n], symbolTable.LabelsStrings(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, &buf, compression)
-					symbolTable.clear()
-				}
+				_ = attemptBatchSend(batch, rwFormat, compression, true)
+				// TODO(alexg) Check for err
 			}
 			queue.ReturnForReuse(batch)
 			timer.Reset(time.Duration(s.qm.cfg.BatchSendDeadline))

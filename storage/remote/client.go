@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -45,6 +46,8 @@ import (
 const maxErrMsgLen = 1024
 
 var UserAgent = fmt.Sprintf("Prometheus/%s", version.Version)
+
+var ErrStatusNotAccepted = errors.New("HTTP StatusNotAccepted") // 406
 
 var (
 	remoteReadQueriesTotal = prometheus.NewCounterVec(
@@ -289,18 +292,19 @@ func (c *Client) Store(ctx context.Context, req []byte, attempt int, compression
 	// See if we got a X-Prometheus-Remote-Write header in the response
 	if promHeader := httpResp.Header.Get(RemoteWriteVersionHeader); promHeader != "" {
 		// Only update lastRWHeader if the X-Prometheus-Remote-Write header is not blank
+		// (It's blank if it wasn't present, we don't care about that distinction.)
 		c.lastRWHeader = promHeader
 	}
 
 	if httpResp.StatusCode == 406 {
 		// Return an unrecoverable error to indicate the 406
-		// TODO - should this be a new error type?
-		return fmt.Errorf("server returned StatusNotAcceptable")
+		// This then gets passed up the chain so we can react to it properly
+		return ErrStatusNotAccepted
 	}
 
-	// TODO - also a server that was accepting, say, "2.0;snappy" might be rolled back to prom 2.x
+	// TODO(alexg) - also a server that was accepting, say, "2.0;snappy" might be rolled back to prom 2.x
 	// and any attempt to send stuff as "2.0;snappy" will come back as 400
-	// TODO - Work out how to differentiate this from any other 4xx error
+	// TODO(alexg) - Work out how to differentiate this from any other 4xx error
 
 	if httpResp.StatusCode/100 != 2 {
 		scanner := bufio.NewScanner(io.LimitReader(httpResp.Body, maxErrMsgLen))

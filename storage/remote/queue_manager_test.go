@@ -78,7 +78,7 @@ func TestSampleDelivery(t *testing.T) {
 		{samples: false, exemplars: false, histograms: true, floatHistograms: false, name: "histograms only"},
 		{samples: false, exemplars: false, histograms: false, floatHistograms: true, name: "float histograms only"},
 
-		// TODO: update some portion of this test to check for the 2.0 metadata
+		// TODO(alexg): update some portion of this test to check for the 2.0 metadata
 		{samples: true, exemplars: false, histograms: false, floatHistograms: false, name: "samples only", rwFormat: Version2},
 		{samples: true, exemplars: true, histograms: true, floatHistograms: true, name: "samples, exemplars, and histograms", rwFormat: Version2},
 		{samples: false, exemplars: true, histograms: false, floatHistograms: false, name: "exemplars only", rwFormat: Version2},
@@ -1879,7 +1879,7 @@ func TestDropOldTimeSeries(t *testing.T) {
 	nSamples := config.DefaultQueueConfig.Capacity * size
 	samples, newSamples, series := createTimeseriesWithOldSamples(nSamples, nSeries)
 
-	// TODO: test with new version
+	// TODO(alexg): test with new version
 	c := NewTestWriteClient(Version1)
 	c.expectSamples(newSamples, series)
 

@@ -203,10 +203,10 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 			// to work out the desired protocol version and compressions
 			// The value of the header is kept in the client so no need to see it here
 			rwFormat = Version2
-			_, err := c.GetProtoVersions(context.Background()) // TODO - better ctx to pass?
+			_, err := c.GetProtoVersions(context.Background()) // TODO(alexg) - better ctx to pass?
 			if err != nil {
-				// TODO - Log an error based on this?
-				// TODO - if we get 405 (MethodNotAllowed) then we should default to 1.0 (and downgrade rwFormat)
+				// TODO(alexg) - Log an error based on this?
+				// TODO(alexg) - if we get 405 (MethodNotAllowed) then we should default to 1.0 (and downgrade rwFormat)
 				// Also see if we need to use lastRWProtoHeader (first return val of GetProtoVersions()) here
 			}
 			// Regardless of what we get back in from GetProtoVersions() we use the value as it overrides
